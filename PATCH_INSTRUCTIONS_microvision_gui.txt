@@ -1,0 +1,26 @@
+
+PATCH microvision_gui.py (summary)
+=================================
+
+1) Add mandatory Login dialog at program start (before main GUI):
+   - Dialog asks: Profile (from mistral_clients.json), Operator login, Operator password.
+   - On success: call operator_login_session(...) and keep operator_user_id in memory.
+   - On failure/cancel: exit app.
+
+2) Add DB mode controls in main window:
+   - Checkbox: "Вкарвай директно в Мистрал (OPEN доставка)"
+   - Combobox: "Клиент/База" (load from mistral_clients.json)
+   - Methods: load_profiles(), get_selected_profile()
+
+3) On Start (after parsing/export or directly from export_items):
+   - If DB mode ON:
+       - selected_profile = get_selected_profile() or active_profile from login
+       - items = parse either from TXT or use your existing export_items list
+       - call push_items_to_mistral(items, selected_profile, operator_user_id, operator_login)
+
+See README_MistralDB.txt for flow, and refer to:
+ - db_integration.operator_login_session()
+ - db_integration.push_items_to_mistral()
+ - export_txt_to_db.parse_mistral_txt_export()
+
+If you want an automated patch, send me your current microvision_gui.py and I will return a diff-applied version.

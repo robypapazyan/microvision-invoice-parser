@@ -1,0 +1,26 @@
+[
+  {
+    "name": "Local TEST",
+    "driver": "firebird-driver",
+    "host": "localhost",
+    "port": 3050,
+    "database": "D:\\base\\TESTBARBERSHOP.FDB",
+    "user": "SYSDBA",
+    "password": "masterkey",
+    "charset": "WIN1251",
+    "default_supplier_id": null,
+    "comment": "Imported by MicroVision",
+    "location_id": 1,
+    "storage_id": 1,
+    "operation_doc_type": 2,
+
+    "auth": {
+      "use_procedures": false,
+      "table_candidates": ["USERS","OPERATORS","POTREBITELI","OPERATORI","USERI","PERSONS"],
+      "login_cols": ["CODE","KOD","LOGIN","USERNAME","USER_NAME","NAME","OPERATOR"],
+      "password_cols": ["PASS","PASSWORD","PAROLA","PASS_HASH","PAROLA_HASH","PWD"],
+      "salt_cols": ["SALT"],
+      "hash_order": ["MD5","SHA1","SHA256","PLAIN"]
+    }
+  }
+]
