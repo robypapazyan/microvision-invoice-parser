@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import sys
 import hashlib
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import tkinter as tk
@@ -15,6 +16,8 @@ from tkinter import ttk, filedialog, messagebox
 
 import db_integration
 import extract_and_prepare
+
+from loguru import logger
 
 try:  # Падаме gracefully ако модулът все още не е наличен
     from license_utils import validate_license  # type: ignore
@@ -25,9 +28,6 @@ try:  # legacy fallback
     from db_integration import operator_login_session  # type: ignore
 except Exception:  # pragma: no cover
     operator_login_session = None  # type: ignore
-
-
-logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
 
 APP_TITLE = "MicroVision Invoice Parser"
@@ -68,10 +68,10 @@ def load_profiles(path: str = CLIENTS_JSON) -> Dict[str, Dict[str, Any]]:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except FileNotFoundError:
-        logging.exception("Файлът %s липсва.", path)
+        logger.exception("Файлът %s липсва.", path)
         return {}
     except Exception as exc:  # pragma: no cover
-        logging.exception("Неуспешно зареждане на профилите: %s", exc)
+        logger.exception("Неуспешно зареждане на профилите: %s", exc)
         return {}
 
     profiles: Dict[str, Dict[str, Any]] = {}
@@ -86,7 +86,7 @@ def load_profiles(path: str = CLIENTS_JSON) -> Dict[str, Dict[str, Any]]:
             name = str(item.get("name") or item.get("client") or f"Профил {idx + 1}")
             profiles[name] = item
     else:
-        logging.error("Неочакван формат на %s. Очаква се dict или list.", path)
+        logger.error("Неочакван формат на %s. Очаква се dict или list.", path)
         return {}
 
     return profiles
@@ -106,7 +106,7 @@ class MicroVisionApp:
             try:
                 self.root.iconbitmap(icon_path)
             except Exception:  # pragma: no cover - iconbitmap не работи на някои платформи
-                logging.debug("Неуспешно зареждане на икона от %s", icon_path)
+                logger.debug("Неуспешно зареждане на икона от %s", icon_path)
 
         self.session = SessionState()
         self.profiles = load_profiles()
@@ -192,16 +192,37 @@ class MicroVisionApp:
 
         status = ttk.Frame(self.root, padding=(16, 4, 16, 12))
         status.pack(side="bottom", fill="x")
+        ttk.Button(status, text="Отвори логове", command=self._on_open_logs).pack(side="left")
         ttk.Label(status, textvariable=self.license_var, foreground="#555").pack(side="right")
 
     def _log(self, text: str) -> None:
         self.output_text.insert(tk.END, text + "\n")
         self.output_text.see(tk.END)
 
+    def _on_open_logs(self) -> None:
+        log_dir = Path(__file__).resolve().parent / "logs"
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:  # pragma: no cover - защитно
+            pass
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(log_dir))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(log_dir)])
+            else:
+                subprocess.Popen(["xdg-open", str(log_dir)])
+        except Exception as exc:
+            logger.exception("Неуспешно отваряне на директорията с логове: %s", exc)
+            messagebox.showerror(
+                "Логове",
+                f"Неуспешно отваряне на {log_dir}.\n{exc}",
+            )
+
     def _report_error(self, message: str, exc: Optional[BaseException] = None) -> None:
         detail = ""
         if exc is not None:
-            logging.exception(message)
+            logger.exception(message)
             detail = str(exc).strip()
         if detail:
             self._log(f"❌ {message}: {detail}")
@@ -436,7 +457,7 @@ class MicroVisionApp:
                 raise ValueError("Няма информация за оставащи дни")
             self.license_var.set(f"Лиценз: оставащи {remaining} дни")
         except Exception as exc:
-            logging.exception("Грешка при проверка на лиценза: %s", exc)
+            logger.exception("Грешка при проверка на лиценза: %s", exc)
             self.license_var.set("Лиценз: грешка при проверка")
 
 

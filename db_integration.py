@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from loguru import logger
+
 from mistral_db import (  # type: ignore[attr-defined]
     MistralDBError,
     connect,
@@ -99,11 +101,13 @@ def _resolve_profile(session: Any) -> Tuple[str, Dict[str, Any]]:
 
 def initialize_session(session: Any, profile_key: str) -> Tuple[Any, Any]:
     profile = _load_profile(profile_key)
+    logger.info("Инициализация на сесия за профил: %s", profile_key)
     conn, cur = connect(profile)
     session.conn = conn
     session.cur = cur
     session.profile_label = profile_key
     session.profile_data = profile
+    logger.info("Успешно свързване за профил: %s", profile_key)
     return conn, cur
 
 
@@ -113,10 +117,12 @@ def _ensure_connection(session: Any, profile_label: str, profile: Dict[str, Any]
     if conn is not None and cur is not None:
         try:
             _require_cursor(conn, cur, profile_label)
+            logger.debug("Използваме съществуваща връзка за профил: %s", profile_label)
             return conn, cur
         except MistralDBError:
             pass
 
+    logger.info("Повторно свързване към профил: %s", profile_label)
     conn, cur = connect(profile)
     session.conn = conn
     session.cur = cur
@@ -132,22 +138,45 @@ def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
         profile_label, profile = _resolve_profile(session)
         _ensure_connection(session, profile_label, profile)
     except MistralDBError as exc:
+        logger.error("Грешка при подготовка за логин: %s", exc)
         return {"error": str(exc)}
 
+    logger.info(
+        "Опит за логин (профил: %s, потребител: %s)",
+        profile_label,
+        username or "<само парола>",
+    )
     try:
         operator_id, operator_login = login_user(username, password)
     except MistralDBError as exc:
         message = str(exc)
+        logger.warning(
+            "Логинът беше неуспешен (профил: %s, потребител: %s): %s",
+            profile_label,
+            username or "<само парола>",
+            message,
+        )
         if "Няма активна връзка" in message:
             try:
                 _ensure_connection(session, profile_label, profile)
                 operator_id, operator_login = login_user(username, password)
             except MistralDBError as retry_exc:
+                logger.error(
+                    "Повторният опит за логин се провали (профил: %s): %s",
+                    profile_label,
+                    retry_exc,
+                )
                 return {"error": str(retry_exc)}
         else:
             return {"error": message}
 
     session.profile_label = profile_label
+    logger.info(
+        "Успешен логин (профил: %s, потребител: %s, оператор ID: %s)",
+        profile_label,
+        operator_login,
+        operator_id,
+    )
     return {"user_id": operator_id, "login": operator_login}
 
 

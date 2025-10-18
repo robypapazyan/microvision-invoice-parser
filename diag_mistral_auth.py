@@ -1,208 +1,197 @@
-"""Диагностика на Mistral login механизма."""
+#!/usr/bin/env python3
+"""CLI диагностика за Mistral login."""
+
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 from typing import Any, Dict, List
 
-from mistral_db import MistralDBError, connect
+from loguru import logger
+
+from mistral_db import (  # type: ignore[attr-defined]
+    MistralDBError,
+    connect,
+    detect_login_method,
+    get_last_login_trace,
+    login_user,
+)
+
+CLIENTS_FILE = Path(__file__).with_name("mistral_clients.json")
 
 
-PROFILE_FILE = Path(__file__).with_name("mistral_clients.json")
-
-
-def _field_type_name(
-    field_type: int,
-    sub_type: int | None,
-    length: int | None,
-    precision: int | None,
-    scale: int | None,
-    char_length: int | None,
-) -> str:
-    mapping = {
-        7: "SMALLINT",
-        8: "INTEGER",
-        9: "QUAD",
-        10: "FLOAT",
-        11: "D_FLOAT",
-        12: "DATE",
-        13: "TIME",
-        14: "CHAR",
-        16: "BIGINT",
-        17: "BOOLEAN",
-        27: "DOUBLE",
-        35: "TIMESTAMP",
-        37: "VARCHAR",
-        40: "CSTRING",
-        261: "BLOB",
-    }
-    base = mapping.get(field_type, f"TYPE_{field_type}")
-    if field_type in {14, 37, 40} and char_length:
-        return f"{base}({char_length})"
-    if field_type in {7, 8, 16, 27}:
-        if scale and scale < 0:
-            digits = precision if precision and precision > 0 else (length or 0)
-            return f"NUMERIC({digits}, {abs(scale)})"
-        return base
-    if field_type == 261 and sub_type == 1:
-        return "BLOB SUB_TYPE TEXT"
-    return base
-
-
-def _load_profile() -> Dict[str, Any]:
-    if not PROFILE_FILE.exists():
+def load_profiles() -> Dict[str, Dict[str, Any]]:
+    if not CLIENTS_FILE.exists():
         raise SystemExit("Липсва mistral_clients.json – няма как да се изпълни диагностиката.")
-    with PROFILE_FILE.open("r", encoding="utf-8") as fh:
-        data = json.load(fh)
+    try:
+        with CLIENTS_FILE.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"mistral_clients.json е в невалиден формат: {exc}") from exc
+
+    profiles: Dict[str, Dict[str, Any]] = {}
     if isinstance(data, dict):
-        if not data:
-            raise SystemExit("mistral_clients.json е празен.")
-        first_key = next(iter(data))
-        profile = data[first_key]
-        if not isinstance(profile, dict):
-            raise SystemExit("Профилът трябва да е описан като обект.")
-        return profile
-    if isinstance(data, list):
-        for item in data:
+        for key, value in data.items():
+            if isinstance(value, dict):
+                profiles[str(key)] = value
+    elif isinstance(data, list):
+        for idx, item in enumerate(data):
             if isinstance(item, dict):
-                return item
-        raise SystemExit("Списъкът с профили не съдържа валиден запис.")
-    raise SystemExit("mistral_clients.json е в неочакван формат (list или dict са допустими).")
+                name = item.get("name") or item.get("client") or item.get("label")
+                if not name:
+                    name = f"Профил {idx + 1}"
+                profiles[str(name)] = item
+    else:
+        raise SystemExit("mistral_clients.json трябва да описва dict или list от профили.")
+
+    if not profiles:
+        raise SystemExit("В mistral_clients.json няма валидни профили.")
+    return profiles
 
 
-def _print_header(title: str) -> None:
-    print(title)
-    print("=" * len(title))
+def pick_profile(profiles: Dict[str, Dict[str, Any]], name: str | None) -> tuple[str, Dict[str, Any]]:
+    if name:
+        if name in profiles:
+            return name, profiles[name]
+        raise SystemExit(f"Профил '{name}' не е намерен в mistral_clients.json.")
+    first_key = next(iter(profiles))
+    return first_key, profiles[first_key]
 
 
-def _print_login_procedures(cur: Any) -> None:
-    print("\nПроцедури, съдържащи 'LOGIN' в името:")
-    cur.execute(
-        """
-        SELECT TRIM(p.rdb$procedure_name), COALESCE(p.rdb$procedure_type, 2)
-        FROM rdb$procedures p
-        WHERE (p.rdb$system_flag IS NULL OR p.rdb$system_flag = 0)
-          AND UPPER(p.rdb$procedure_name) LIKE '%LOGIN%'
-        ORDER BY 1
-        """
-    )
-    rows = cur.fetchall()
-    if not rows:
-        print("  (не са открити подходящи процедури)")
+def describe_meta(meta: Dict[str, Any]) -> str:
+    mode = meta.get("mode")
+    if mode == "sp":
+        return f"Процедура {meta.get('name')} ({meta.get('sp_kind')})"
+    if mode == "table":
+        fields = meta.get("fields", {})
+        name = meta.get("name")
+        has_name = "да" if fields.get("has_name") else "не"
+        has_pass = "да" if fields.get("has_pass") else "не"
+        return f"Таблица {name} (NAME: {has_name}, PASS: {has_pass})"
+    return "Непознат режим"
+
+
+def print_trace(trace: List[Dict[str, Any]]) -> None:
+    if not trace:
+        print("\nНяма налична хронология от опита за логин.")
         return
-    for name, proc_type in rows:
-        call_type = "SELECTABLE" if proc_type == 1 else "EXECUTE"
-        print(f"- {name} [{call_type}]")
-        cur.execute(
-            """
-            SELECT
-                COALESCE(pp.rdb$parameter_type, 0) AS param_type,
-                TRIM(pp.rdb$parameter_name) AS param_name,
-                COALESCE(pp.rdb$parameter_number, 0) AS param_number,
-                f.rdb$field_type,
-                f.rdb$field_sub_type,
-                f.rdb$field_length,
-                f.rdb$field_precision,
-                f.rdb$field_scale,
-                f.rdb$character_length
-            FROM rdb$procedure_parameters pp
-            JOIN rdb$fields f ON f.rdb$field_name = pp.rdb$field_source
-            WHERE pp.rdb$procedure_name = ?
-            ORDER BY param_type, param_number
-            """,
-            (name,),
-        )
-        params = cur.fetchall()
-        ins = [p for p in params if p[0] == 0]
-        outs = [p for p in params if p[0] != 0]
-        if ins:
-            print("    Входни параметри:")
-            for row in ins:
-                print(f"      • {row[1]} : {_field_type_name(row[3], row[4], row[5], row[6], row[7], row[8])}")
-        else:
-            print("    Входни параметри: (няма)")
-        if outs:
-            print("    Изходни параметри:")
-            for row in outs:
-                print(f"      • {row[1]} : {_field_type_name(row[3], row[4], row[5], row[6], row[7], row[8])}")
-        else:
-            print("    Изходни параметри: (няма)")
 
-
-def _fetch_table_columns(cur: Any, table: str) -> List[Dict[str, Any]]:
-    cur.execute(
-        """
-        SELECT
-            TRIM(rf.rdb$field_name) AS col_name,
-            COALESCE(rf.rdb$null_flag, 0) AS null_flag,
-            f.rdb$field_type,
-            f.rdb$field_sub_type,
-            f.rdb$field_length,
-            f.rdb$field_precision,
-            f.rdb$field_scale,
-            f.rdb$character_length
-        FROM rdb$relation_fields rf
-        JOIN rdb$fields f ON f.rdb$field_name = rf.rdb$field_source
-        WHERE rf.rdb$relation_name = ?
-        ORDER BY rf.rdb$field_position
-        """,
-        (table,),
-    )
-    result = []
-    for row in cur.fetchall():
-        result.append(
-            {
-                "name": row[0],
-                "not_null": bool(row[1]),
-                "type_name": _field_type_name(row[2], row[3], row[4], row[5], row[6], row[7]),
-            }
-        )
-    return result
-
-
-def _print_table_info(cur: Any, table: str) -> None:
-    print(f"\nТаблица {table}:")
-    columns = _fetch_table_columns(cur, table)
-    if not columns:
-        print("  Таблицата не е открита или няма колони.")
-        return
-    has_name = any(col["name"].upper() == "NAME" for col in columns)
-    has_pass = any(col["name"].upper() == "PASS" for col in columns)
-    print(f"  Има колона NAME: {'да' if has_name else 'не'}")
-    print(f"  Има колона PASS: {'да' if has_pass else 'не'}")
-    print("  Колони:")
-    for col in columns:
-        required = []
-        if col["name"].upper() == "NAME":
-            required.append("← NAME")
-        if col["name"].upper() == "PASS":
-            required.append("← PASS")
-        label = f" ({', '.join(required)})" if required else ""
-        nullable = "NOT NULL" if col["not_null"] else "NULLABLE"
-        print(f"    • {col['name']} : {col['type_name']} [{nullable}]{label}")
-
-
-def _print_sample_queries() -> None:
-    print("\nПримерни SELECT заявки, използвани от логин модула:")
-    print("  - SELECT ID, NAME FROM USERS WHERE NAME=? AND PASS=?")
-    print("  - SELECT ID, NAME FROM LOGUSERS WHERE NAME=? AND PASS=?")
-    print("  - (само парола) SELECT ID, NAME FROM <TABLE> WHERE PASS=?")
+    print("\nХронология на опита:")
+    for step in trace:
+        action = step.get("action")
+        if action == "start":
+            print(
+                f"- Старт: профил {step.get('profile')} | потребител: {step.get('username')}"
+            )
+        elif action == "procedure_attempt":
+            mode = step.get("mode")
+            params = step.get("params", {})
+            print(
+                f"- Процедура ({mode}): {step.get('procedure')} | SQL: {step.get('sql')}"
+            )
+            print(
+                f"    параметри: потребител={params.get('username')} парола={params.get('password')}"
+            )
+        elif action == "procedure_switch":
+            print(
+                f"- Превключване от {step.get('from')} към {step.get('to')} (причина: {step.get('reason')})"
+            )
+        elif action == "procedure_error":
+            print(
+                f"- Грешка при процедура ({step.get('mode')}): {step.get('procedure')} -> {step.get('error')}"
+            )
+        elif action == "procedure_result":
+            print(
+                f"- Резултат процедура ({step.get('mode')}): {step.get('procedure')} | редове: {step.get('rows')}"
+            )
+        elif action == "procedure_callproc":
+            print(f"- Опит за callproc: {step.get('procedure')}")
+        elif action == "table_attempt":
+            params = step.get("params", {})
+            print(
+                f"- Таблица ({step.get('mode')}): {step.get('table')} | SQL: {step.get('sql')}"
+            )
+            print(
+                f"    параметри: потребител={params.get('username')} парола={params.get('password')}"
+            )
+        elif action == "table_error":
+            print(f"- Грешка при таблица {step.get('table')}: {step.get('error')}")
+        elif action == "table_result":
+            print(f"- Резултат от таблица {step.get('table')}: {step.get('rows')} ред(а)")
+        elif action == "success":
+            print(
+                f"- Успех: оператор ID={step.get('operator_id')} login={step.get('operator_login')}"
+            )
+        elif action == "failure":
+            print(f"- Неуспех: {step.get('message')}")
 
 
 def main() -> None:
-    profile = _load_profile()
+    parser = argparse.ArgumentParser(description="Диагностика на Mistral login.")
+    parser.add_argument("--profile", help="Име на профила от mistral_clients.json")
+    parser.add_argument("--user", default="", help="Потребителско име (може да е празно)")
+    parser.add_argument("--password", default="", help="Парола")
+    parser.add_argument(
+        "--list-profiles",
+        action="store_true",
+        help="Изброй наличните профили и излез",
+    )
+    args = parser.parse_args()
+
+    profiles = load_profiles()
+    if args.list_profiles:
+        print("Налични профили:")
+        for name in profiles:
+            print(f"- {name}")
+        return
+
+    profile_name, profile = pick_profile(profiles, args.profile)
+    print(f"Профил: {profile_name}")
+
     try:
         conn, cur = connect(profile)
     except MistralDBError as exc:
-        raise SystemExit(f"Неуспешно свързване: {exc}")
+        raise SystemExit(f"Свързване: НЕУСПЕШНО – {exc}")
 
-    label = profile.get("name") or profile.get("label") or profile.get("client") or profile.get("database")
-    _print_header(f"Профил: {label}")
-    _print_login_procedures(cur)
-    _print_table_info(cur, "USERS")
-    _print_table_info(cur, "LOGUSERS")
-    _print_sample_queries()
+    print("Свързване: УСПЕШНО")
+    try:
+        meta = detect_login_method(cur)
+    except MistralDBError as exc:
+        conn.close()
+        raise SystemExit(f"Откриване на логин механизъм: НЕУСПЕШНО – {exc}")
+
+    print(f"Открит login режим: {describe_meta(meta)}")
+    if meta.get("mode") == "table":
+        candidates = [c.get("name") for c in meta.get("candidates", []) if c.get("name")]
+        if candidates:
+            print("Възможни таблици: " + ", ".join(candidates))
+
+    result_text = ""
+    try:
+        operator_id, operator_login = login_user(args.user or "", args.password or "")
+    except MistralDBError as exc:
+        result_text = f"Краен резултат: НЕВАЛИДЕН – {exc}"
+    else:
+        result_text = (
+            "Краен резултат: УСПЕХ – "
+            f"оператор ID={operator_id}, потребител={operator_login}"
+        )
+    finally:
+        trace = get_last_login_trace()
+        print_trace(trace)
+        try:
+            cur.close()
+        except Exception:  # pragma: no cover - защитно
+            pass
+        try:
+            conn.close()
+        except Exception:  # pragma: no cover - защитно
+            pass
+
+    print("\n" + result_text)
 
 
 if __name__ == "__main__":
+    logger.info("Стартира диагностика на логин модул.")
     main()
