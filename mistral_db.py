@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from contextlib import contextmanager
 from datetime import datetime, date
 from decimal import Decimal, ROUND_HALF_UP
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from loguru import logger
 
 try:  # предпочитаме fdb (поддържа Firebird 2.5)
     import fdb  # type: ignore
@@ -25,6 +29,21 @@ except ImportError:  # pragma: no cover - fallback към firebird-driver
         ) from exc
 
 
+if not _LOG_CONFIGURED:
+    log_dir = Path(__file__).resolve().parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_level = os.getenv("MICROVISION_LOG_LEVEL", "INFO").upper() or "INFO"
+    logger.add(
+        log_dir / "app_{time:YYYYMMDD}.log",
+        rotation="5 MB",
+        retention="7 files",
+        level=log_level,
+        encoding="utf-8",
+    )
+    _LOG_CONFIGURED = True
+
+
+_LOG_CONFIGURED = False
 _CONN: Any | None = None
 _CUR: Any | None = None
 _PROFILE: Dict[str, Any] | None = None
@@ -34,6 +53,7 @@ _DELIVERY_TABLES: Dict[str, str] | None = None
 _DELIVERY_GENERATORS: Dict[str, Optional[str]] | None = None
 _TABLE_COLUMNS: Dict[str, Dict[str, Dict[str, Any]]] = {}
 _DELIVERY_CONTEXT: Dict[int, Dict[str, Any]] = {}
+_LOGIN_TRACE: List[Dict[str, Any]] = []
 
 
 class MistralDBError(RuntimeError):
@@ -75,6 +95,16 @@ def _require_cursor(
     if not active_conn or not active_cur:
         raise MistralDBError(f"Няма активна връзка – опитайте отново (профил: {label}).")
     return active_cur
+
+
+def _record_login_step(step: Dict[str, Any]) -> None:
+    step_copy = dict(step)
+    step_copy.setdefault("timestamp", datetime.now().isoformat(timespec="seconds"))
+    _LOGIN_TRACE.append(step_copy)
+
+
+def get_last_login_trace() -> List[Dict[str, Any]]:
+    return list(_LOGIN_TRACE)
 
 
 @contextmanager
@@ -345,10 +375,20 @@ def connect(profile: Dict[str, Any]) -> Tuple[Any, Any]:
         or database
     )
 
+    logger.info(
+        "Свързване към база (профил: {profile}, host={host}, database={db}, driver={driver}).",
+        profile=profile_label,
+        host=host,
+        db=database,
+        driver=_FB_API,
+    )
     try:
         conn = _connect_raw(host, port, database, user, password, charset)
         cur = conn.cursor()
     except Exception as exc:  # pragma: no cover - защитно
+        logger.exception(
+            "Неуспешно свързване към база (профил: %s). host=%s, database=%s", profile_label, host, database
+        )
         raise MistralDBError(
             f"Грешка при свързване към база (профил: {profile_label}). Проверете хост/порт/права."
         ) from exc
@@ -362,14 +402,16 @@ def connect(profile: Dict[str, Any]) -> Tuple[Any, Any]:
     _DELIVERY_GENERATORS = None
     _TABLE_COLUMNS.clear()
     _DELIVERY_CONTEXT.clear()
+    logger.info("Свързването е успешно (профил: %s).", profile_label)
     return conn, cur
 
 
-def detect_login_method(cur: Any) -> Dict[str, Any]:
+def detect_login_method(cur: Any | None = None) -> Dict[str, Any]:
     """Открива дали се ползва LOGIN процедура или USERS/LOGUSERS."""
 
     profile_label = _profile_label()
     cur = _require_cursor(_CONN, cur, profile_label)
+    logger.debug("Откриване на login механизъм (профил: %s).", profile_label)
 
     cur.execute(
         """
@@ -381,10 +423,12 @@ def detect_login_method(cur: Any) -> Dict[str, Any]:
         """
     )
     procs = cur.fetchall()
-    for name, proc_type in procs:
+    for raw_name, proc_type in procs:
+        name = (raw_name or "").strip()
+        if not name:
+            continue
         conn = getattr(cur, "connection", None) or _require_connection()
-        pcur = conn.cursor()
-        pcur = _require_cursor(conn, pcur, profile_label)
+        pcur = _require_cursor(conn, conn.cursor(), profile_label)
         pcur.execute(
             """
             SELECT
@@ -416,16 +460,30 @@ def detect_login_method(cur: Any) -> Dict[str, Any]:
             }
             (inputs if row[0] == 0 else outputs).append(entry)
         pcur.close()
+        source_cur = _require_cursor(conn, conn.cursor(), profile_label)
+        source_cur.execute(
+            "SELECT rdb$procedure_source FROM rdb$procedures WHERE rdb$procedure_name = ?",
+            (name,),
+        )
+        source_row = source_cur.fetchone()
+        source_cur.close()
+        source_text = (source_row[0] or "") if source_row else ""
+        source_upper = source_text.upper() if isinstance(source_text, str) else ""
+        sp_kind = "selectable" if int(proc_type or 2) == 1 else "executable"
+        if "SUSPEND" in source_upper:
+            sp_kind = "selectable"
         if inputs:
-            return {
+            meta = {
                 "mode": "sp",
                 "name": name,
+                "sp_kind": sp_kind,
                 "fields": {
                     "inputs": inputs,
                     "outputs": outputs,
-                    "call": "select" if proc_type == 1 else "execute",
                 },
             }
+            logger.info("Открита login процедура: {name} ({kind}).", name=name, kind=sp_kind)
+            return meta
 
     table_candidates: List[Dict[str, Any]] = []
     for table_name in ("USERS", "LOGUSERS"):
@@ -433,7 +491,9 @@ def detect_login_method(cur: Any) -> Dict[str, Any]:
         if not cols:
             continue
         upper_map = {col.upper(): col for col in cols}
-        if "NAME" not in upper_map or "PASS" not in upper_map:
+        has_name = "NAME" in upper_map
+        has_pass = "PASS" in upper_map
+        if not has_pass:
             continue
         id_col = None
         for candidate in ("ID", "CODE", "KOD", "USER_ID", "OP_ID"):
@@ -445,24 +505,29 @@ def detect_login_method(cur: Any) -> Dict[str, Any]:
         entry = {
             "mode": "table",
             "name": table_name,
+            "sp_kind": None,
             "fields": {
                 "id": id_col,
-                "login": upper_map["NAME"],
-                "passwords": [upper_map["PASS"]],
-                "salts": [],
+                "login": upper_map.get("NAME"),
+                "password": upper_map["PASS"],
+                "has_name": has_name,
+                "has_pass": has_pass,
             },
         }
         table_candidates.append(entry)
 
     if table_candidates:
-        primary = {
-            "mode": "table",
-            "name": table_candidates[0]["name"],
-            "fields": dict(table_candidates[0]["fields"]),
-            "candidates": table_candidates,
-        }
+        primary = dict(table_candidates[0])
+        primary["candidates"] = table_candidates
+        logger.info(
+            "Открит login чрез таблица: {table} (NAME={has_name}, PASS={has_pass}).",
+            table=primary["name"],
+            has_name="да" if primary["fields"].get("has_name") else "не",
+            has_pass="да" if primary["fields"].get("has_pass") else "не",
+        )
         return primary
 
+    logger.error("Не е открит механизъм за логин (профил: %s).", profile_label)
     raise UnsupportedAuthSchema(
         "Не успях да открия механизъм за логин. Нужна е допълнителна конфигурация."
     )
@@ -471,173 +536,351 @@ def detect_login_method(cur: Any) -> Dict[str, Any]:
 def login_user(username: str, password: str) -> Tuple[int, str]:
     """Връща (operator_id, operator_login) или вдига MistralDBError."""
 
-    global _LOGIN_META
+    global _LOGIN_META, _LOGIN_TRACE
     cur = _require_cursor()
+    username = username or ""
+    password = password or ""
+    _LOGIN_TRACE.clear()
+    _record_login_step(
+        {"action": "start", "profile": _profile_label(), "username": username or "<само парола>"}
+    )
+
     if _LOGIN_META is None:
         _LOGIN_META = detect_login_method(cur)
     meta = _LOGIN_META
-    if meta["mode"] == "sp":
-        return _login_via_procedure(meta, username, password)
-    return _login_via_table(meta, username, password)
+
+    try:
+        if meta.get("mode") == "sp":
+            result = _login_via_procedure(meta, username, password)
+        else:
+            result = _login_via_table(meta, username, password)
+    except MistralDBError as exc:
+        _record_login_step({"action": "failure", "message": str(exc)})
+        logger.warning(
+            "Неуспешен вход (профил: %s, потребител: %s): %s",
+            _profile_label(),
+            username or "<само парола>",
+            exc,
+        )
+        raise
+
+    operator_id, operator_login = result
+    _record_login_step(
+        {
+            "action": "success",
+            "operator_id": operator_id,
+            "operator_login": operator_login,
+            "mode": meta.get("mode"),
+        }
+    )
+    logger.info(
+        "Успешен вход (профил: %s, потребител: %s, режим: %s).",
+        _profile_label(),
+        username or operator_login or "<само парола>",
+        meta.get("mode"),
+    )
+    return operator_id, operator_login
 
 
-def _login_via_procedure(meta: Dict[str, Any], username: str, password: str) -> Tuple[int, str]:
-    cur = _require_cursor()
-    name = meta["name"]
-    inputs = meta["fields"].get("inputs", [])
-    call = meta["fields"].get("call", "execute")
+def _build_procedure_args(inputs: List[Dict[str, Any]], username: str, password: str) -> List[Any]:
     login_param_names = {"LOGIN", "USERNAME", "USER_NAME", "CODE", "OPERATOR"}
     pass_param_names = {"PASS", "PASSWORD", "PAROLA", "PWD"}
     args: List[Any] = [None] * len(inputs)
     for field in inputs:
-        pname = (field["name"] or "").upper()
-        pos = field["position"]
+        pname = (field.get("name") or "").upper()
+        pos = field.get("position", 0)
         if pname in login_param_names:
-            args[pos] = username if username else None
+            args[pos] = username or None
         elif pname in pass_param_names:
             args[pos] = password
-        elif "USER" in pname and not username:
-            args[pos] = None
         else:
             args[pos] = None
-    placeholders = ", ".join(["?"] * len(inputs))
-    try:
-        if call == "select":
-            cur.execute(f"SELECT * FROM {name}({placeholders})", args)
-            row = cur.fetchone()
-        else:
-            cur.execute(f"EXECUTE PROCEDURE {name} {placeholders}" if placeholders else f"EXECUTE PROCEDURE {name}", args)
-            row = cur.fetchone()
-    except _FB_ERROR as exc:
-        raise MistralDBError(f"Грешка при изпълнение на {name}: {exc}") from exc
-    if not row:
-        raise MistralDBError("Невалиден потребител или парола")
-    outputs = meta["fields"].get("outputs", [])
+    return args
+
+
+def _is_no_result_set_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "does not produce result set" in message or "no result set" in message
+
+
+def _extract_operator_from_row(
+    row: Sequence[Any], outputs: List[Dict[str, Any]], username: str
+) -> Tuple[int, str]:
     operator_id: Optional[int] = None
     operator_login: Optional[str] = None
+    sequence = list(row)
     for idx, field in enumerate(outputs):
-        value = row[idx] if idx < len(row) else None
+        value = sequence[idx] if idx < len(sequence) else None
         if value is None:
             continue
         if operator_id is None and isinstance(value, (int, float)):
             try:
                 operator_id = int(value)
                 continue
-            except Exception:  # pragma: no cover - защитно
+            except (TypeError, ValueError):
                 pass
-        if operator_login is None and field["name"] and any(
-            token in field["name"].upper() for token in ("LOGIN", "USER", "CODE")
-        ):
+        name = (field.get("name") or "").upper()
+        if operator_login is None and name and any(token in name for token in ("LOGIN", "USER", "CODE")):
             operator_login = str(value).strip()
-    if operator_id is None:
+    if operator_id is None and sequence:
         try:
-            operator_id = int(row[0])
-        except Exception as exc:  # pragma: no cover
+            operator_id = int(sequence[0])
+        except (TypeError, ValueError) as exc:
             raise MistralDBError(
                 "Процедурата за логин не върна идентификатор. Нужна е доработка."
             ) from exc
+    if operator_login is None and len(sequence) > 1:
+        operator_login = str(sequence[1]).strip() if sequence[1] is not None else None
     if operator_login is None:
-        operator_login = username or (str(row[1]).strip() if len(row) > 1 else str(operator_id))
+        operator_login = username or (str(operator_id) if operator_id is not None else "")
     if operator_id is None:
         raise MistralDBError("Невалиден потребител или парола")
     return operator_id, operator_login
 
 
-def _login_via_table(meta: Dict[str, Any], username: str, password: str) -> Tuple[int, str]:
-    candidates = meta.get("candidates") or [meta]
-    last_unknown = False
-    for candidate in candidates:
-        result, unknown = _login_via_table_candidate(candidate, username, password)
-        if result is not None:
-            return result
-        last_unknown = last_unknown or unknown
-    if last_unknown:
-        raise UnsupportedAuthSchema(
-            "Паролата е записана с непознат алгоритъм. Нужна е допълнителна информация."
-        )
-    raise MistralDBError("Невалиден потребител или парола")
-
-
-def _login_via_table_candidate(
-    meta: Dict[str, Any], username: str, password: str
-) -> Tuple[Optional[Tuple[int, str]], bool]:
-    table = meta["name"]
-    fields = meta.get("fields", {})
-    id_col = fields.get("id")
-    login_col = fields.get("login")
-    pass_cols = fields.get("passwords", [])
-    salt_cols = fields.get("salts", [])
-    if not (id_col and pass_cols):
-        return None, False
-
-    select_cols = [id_col]
-    if login_col:
-        select_cols.append(login_col)
-    select_cols.extend(pass_cols)
-    select_cols.extend(salt_cols)
-
+def _login_via_procedure(meta: Dict[str, Any], username: str, password: str) -> Tuple[int, str]:
     cur = _require_cursor()
+    name = meta.get("name")
+    inputs = meta.get("fields", {}).get("inputs", [])
+    outputs = meta.get("fields", {}).get("outputs", [])
+    args = _build_procedure_args(inputs, username, password)
+    placeholders = ", ".join(["?"] * len(inputs))
+    sp_kind = meta.get("sp_kind") or "executable"
 
-    def _fetch_all() -> List[Tuple[Any, ...]]:
+    def _log_params() -> Dict[str, Any]:
+        return {
+            "username": username or "<празно>",
+            "password": "***" if password else "",
+        }
+
+    if sp_kind == "selectable":
+        sql = f"SELECT * FROM {name}({placeholders})" if placeholders else f"SELECT * FROM {name}"
+        _record_login_step(
+            {
+                "action": "procedure_attempt",
+                "procedure": name,
+                "mode": "select",
+                "sql": sql,
+                "params": _log_params(),
+            }
+        )
+        logger.info("Login чрез процедура %s (SELECT режим).", name)
         try:
-            cur.execute(f"SELECT {', '.join(select_cols)} FROM {table}")
-            return cur.fetchall()
+            cur.execute(sql, args)
+            rows = cur.fetchall()
         except _FB_ERROR as exc:
+            if _is_no_result_set_error(exc):
+                logger.warning(
+                    "Процедурата %s не връща резултат при SELECT. Превключваме към EXECUTE.",
+                    name,
+                )
+                _record_login_step(
+                    {
+                        "action": "procedure_switch",
+                        "procedure": name,
+                        "from": "select",
+                        "to": "execute",
+                        "reason": "no-result-set",
+                    }
+                )
+                meta["sp_kind"] = "executable"
+            else:
+                _record_login_step(
+                    {
+                        "action": "procedure_error",
+                        "procedure": name,
+                        "mode": "select",
+                        "error": str(exc),
+                    }
+                )
+                raise MistralDBError(f"Грешка при изпълнение на {name}: {exc}") from exc
+        else:
+            row_count = len(rows)
+            _record_login_step(
+                {
+                    "action": "procedure_result",
+                    "procedure": name,
+                    "mode": "select",
+                    "rows": row_count,
+                }
+            )
+            logger.debug("Процедура %s (SELECT) върна %s ред(а).", name, row_count)
+            if row_count == 0:
+                raise MistralDBError("Невалиден потребител или парола")
+            row = rows[0]
+            if row_count > 1:
+                logger.warning(
+                    "Процедура %s върна повече от един ред (%s). Използваме първия.",
+                    name,
+                    row_count,
+                )
+            operator_id, operator_login = _extract_operator_from_row(row, outputs, username)
+            return operator_id, operator_login
+
+    exec_sql = (
+        f"EXECUTE PROCEDURE {name} {placeholders}" if placeholders else f"EXECUTE PROCEDURE {name}"
+    )
+    _record_login_step(
+        {
+            "action": "procedure_attempt",
+            "procedure": name,
+            "mode": "execute",
+            "sql": exec_sql,
+            "params": _log_params(),
+        }
+    )
+    logger.info("Login чрез процедура %s (EXECUTE режим).", name)
+    row: Optional[Sequence[Any]] = None
+    try:
+        cur.execute(exec_sql, args)
+        try:
+            fetched = cur.fetchone()
+        except _FB_ERROR as exc:
+            if _is_no_result_set_error(exc):
+                fetched = None
+            else:
+                _record_login_step(
+                    {
+                        "action": "procedure_error",
+                        "procedure": name,
+                        "mode": "execute",
+                        "error": str(exc),
+                    }
+                )
+                raise MistralDBError(f"Грешка при изпълнение на {name}: {exc}") from exc
+        row = fetched
+    except _FB_ERROR as exc:
+        _record_login_step(
+            {
+                "action": "procedure_error",
+                "procedure": name,
+                "mode": "execute",
+                "error": str(exc),
+            }
+        )
+        raise MistralDBError(f"Грешка при изпълнение на {name}: {exc}") from exc
+
+    if row is None and hasattr(cur, "callproc"):
+        _record_login_step(
+            {
+                "action": "procedure_callproc",
+                "procedure": name,
+                "params": _log_params(),
+            }
+        )
+        logger.debug("Опит за callproc върху %s.", name)
+        try:
+            call_result = cur.callproc(name, tuple(args))  # type: ignore[attr-defined]
+        except Exception as exc:  # pragma: no cover - защитно
+            _record_login_step(
+                {
+                    "action": "procedure_error",
+                    "procedure": name,
+                    "mode": "callproc",
+                    "error": str(exc),
+                }
+            )
+            raise MistralDBError(f"Грешка при изпълнение на {name}: {exc}") from exc
+        if isinstance(call_result, (list, tuple)):
+            row = list(call_result)
+        else:
+            row = [call_result]
+
+    if row is None:
+        _record_login_step(
+            {
+                "action": "procedure_result",
+                "procedure": name,
+                "mode": "execute",
+                "rows": 0,
+            }
+        )
+        raise MistralDBError("Невалиден потребител или парола")
+
+    _record_login_step(
+        {
+            "action": "procedure_result",
+            "procedure": name,
+            "mode": "execute",
+            "rows": 1,
+        }
+    )
+    return _extract_operator_from_row(row, outputs, username)
+
+
+def _login_via_table(meta: Dict[str, Any], username: str, password: str) -> Tuple[int, str]:
+    cur = _require_cursor()
+    candidates = meta.get("candidates") or [meta]
+    username = username.strip()
+    password = password.strip()
+
+    for candidate in candidates:
+        table = candidate.get("name")
+        fields = candidate.get("fields", {})
+        id_col = fields.get("id")
+        login_col = fields.get("login")
+        pass_col = fields.get("password")
+        if not (table and id_col and pass_col):
+            continue
+        use_username = bool(username and login_col)
+        if use_username:
+            sql = f"SELECT {id_col}, {login_col} FROM {table} WHERE {login_col} = ? AND {pass_col} = ?"
+            params: Tuple[Any, ...] = (username, password)
+        else:
+            extra = f", {login_col}" if login_col else ""
+            sql = f"SELECT {id_col}{extra} FROM {table} WHERE {pass_col} = ?"
+            params = (password,)
+        _record_login_step(
+            {
+                "action": "table_attempt",
+                "table": table,
+                "mode": "username+password" if use_username else "password-only",
+                "sql": sql,
+                "params": {
+                    "username": username if use_username else None,
+                    "password": "***" if password else "",
+                },
+            }
+        )
+        logger.info(
+            "Login чрез таблица %s (%s режим).",
+            table,
+            "потребител+парола" if use_username else "само парола",
+        )
+        try:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        except _FB_ERROR as exc:
+            _record_login_step(
+                {
+                    "action": "table_error",
+                    "table": table,
+                    "error": str(exc),
+                }
+            )
             raise MistralDBError(f"Грешка при четене от {table}: {exc}") from exc
 
-    def _fetch_by_login(login_value: str) -> Optional[Tuple[Any, ...]]:
-        if not login_col:
-            return None
-        sql = (
-            f"SELECT {', '.join(select_cols)} FROM {table} "
-            f"WHERE UPPER({login_col}) = UPPER(?)"
+        row_count = len(rows)
+        _record_login_step({"action": "table_result", "table": table, "rows": row_count})
+        logger.debug("Запитване към %s върна %s ред(а).", table, row_count)
+
+        if row_count == 0:
+            continue
+        if row_count > 1:
+            raise MistralDBError(
+                "Намерени са няколко оператора с тази парола. Моля, попълнете и потребителско име."
+            )
+        row = rows[0]
+        operator_id = int(row[0])
+        operator_login = (
+            str(row[1]).strip()
+            if use_username and len(row) > 1 and row[1] is not None
+            else (username or str(operator_id))
         )
-        try:
-            cur.execute(sql, (login_value,))
-        except _FB_ERROR as exc:
-            raise MistralDBError(f"Грешка при проверка на {table}: {exc}") from exc
-        return cur.fetchone()
+        meta["name"] = table
+        return operator_id, operator_login
 
-    salts_idx_start = 1 + (1 if login_col else 0) + len(pass_cols)
-    salts_idx_end = salts_idx_start + len(salt_cols)
-
-    if username:
-        row = _fetch_by_login(username)
-        if not row:
-            return None, False
-        user_id = int(row[0])
-        login_value = str(row[1]) if login_col and row[1] is not None else username
-        pass_values = row[1 + (1 if login_col else 0) : 1 + (1 if login_col else 0) + len(pass_cols)]
-        salt_values = row[salts_idx_start:salts_idx_end]
-        unknown_algo = False
-        for field_name, stored_value in zip(pass_cols, pass_values):
-            matched, unknown = _match_password(password, stored_value, salt_values, field_name)
-            if matched:
-                return (user_id, str(login_value).strip() or username), False
-            unknown_algo = unknown_algo or unknown
-        return None, unknown_algo
-
-    rows = _fetch_all()
-    matches: List[Tuple[int, str]] = []
-    unknown_any = False
-    for row in rows:
-        user_id = int(row[0])
-        login_value = str(row[1]).strip() if login_col and row[1] else ""
-        pass_values = row[1 + (1 if login_col else 0) : 1 + (1 if login_col else 0) + len(pass_cols)]
-        salt_values = row[salts_idx_start:salts_idx_end]
-        for field_name, stored_value in zip(pass_cols, pass_values):
-            matched, unknown = _match_password(password, stored_value, salt_values, field_name)
-            if matched:
-                matches.append((user_id, login_value or str(user_id)))
-                break
-            unknown_any = unknown_any or unknown
-    if len(matches) > 1:
-        raise MistralDBError(
-            "Намерени са няколко оператора с тази парола. Моля, попълнете и потребителско име."
-        )
-    if len(matches) == 1:
-        return matches[0], False
-    return None, unknown_any
+    raise MistralDBError("Невалиден потребител или парола")
 
 
 def get_item_info(code_or_name: str) -> Optional[Dict[str, Any]]:
@@ -705,6 +948,7 @@ def create_open_delivery(operator_id: int) -> int:
     """Създава OPEN доставка и връща нейния ID."""
     if operator_id is None:
         raise MistralDBError("Липсва operator_id за OPEN доставка.")
+    _require_cursor()
     conn = _require_connection()
     cur = conn.cursor()
     header_table, _ = _ensure_delivery_meta(cur)
@@ -765,6 +1009,7 @@ def push_items_to_mistral(delivery_id: int, items: List[Dict[str, Any]]) -> None
     """Вкарва редовете за доставка в TEMPDELIVERYSDR."""
     if not items:
         return
+    _require_cursor()
     conn = _require_connection()
     cur = conn.cursor()
     header_table, detail_table = _ensure_delivery_meta(cur)
