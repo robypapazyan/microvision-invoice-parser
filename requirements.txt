@@ -1,0 +1,7 @@
+loguru
+PyPDF2
+pdf2image
+Pillow
+pytesseract
+fdb
+firebird-driver

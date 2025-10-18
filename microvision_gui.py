@@ -8,6 +8,7 @@ import sys
 import hashlib
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -17,12 +18,7 @@ from tkinter import ttk, filedialog, messagebox
 import db_integration
 import extract_and_prepare
 
-from loguru import logger
-
-try:  # Падаме gracefully ако модулът все още не е наличен
-    from license_utils import validate_license  # type: ignore
-except Exception:  # pragma: no cover - защитаваме се при липсващ модул
-    validate_license = None  # type: ignore
+from mistral_db import logger
 
 try:  # legacy fallback
     from db_integration import operator_login_session  # type: ignore
@@ -46,6 +42,7 @@ class SessionState:
     user_id: Optional[int] = None
     raw_login_payload: Any = None
     db_mode: bool = False
+    last_login_trace: Optional[List[Dict[str, Any]]] = None
 
 
 
@@ -114,16 +111,20 @@ class MicroVisionApp:
         self.active_profile: Optional[Dict[str, Any]] = None
         self.active_profile_name: Optional[str] = None
         self.rows_cache: List[Dict[str, Any]] = []
+        self.last_login_trace: List[Dict[str, Any]] = []
 
         self._build_ui()
         self.session.db_mode = bool(self.db_mode_var.get())
 
         self._log("Приложението е стартирано.")
+        initial_profile_label = "няма профил"
         if self.profile_names:
             self.profile_cmb.current(0)
             self._apply_profile(self.profile_names[0])
+            initial_profile_label = self.active_profile_name or self.profile_names[0]
         else:
             self._log("⚠️ Няма профили в mistral_clients.json.")
+        logger.info("Приложението е стартирано. Профил: %s", initial_profile_label)
 
         self._refresh_license_text()
         self.root.after(150, self.password_entry.focus_set)
@@ -165,6 +166,13 @@ class MicroVisionApp:
         ttk.Label(strip, textvariable=self.login_status_var, foreground="#006400").grid(
             row=0, column=7, sticky="w"
         )
+        self.login_diag_btn = ttk.Button(
+            strip,
+            text="Покажи диагностика",
+            command=self._show_login_diagnostics,
+        )
+        self.login_diag_btn.grid(row=0, column=8, sticky="w", padx=(4, 0))
+        self.login_diag_btn.grid_remove()
 
         self.db_mode_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -229,6 +237,94 @@ class MicroVisionApp:
         else:
             self._log(f"❌ {message}")
 
+    def _toggle_login_diag_button(self, show: bool) -> None:
+        if not hasattr(self, "login_diag_btn"):
+            return
+        try:
+            if show:
+                self.login_diag_btn.grid()
+            else:
+                self.login_diag_btn.grid_remove()
+        except Exception:  # pragma: no cover - защитно
+            pass
+
+    def _format_login_trace(self, trace: List[Dict[str, Any]]) -> List[str]:
+        lines: List[str] = []
+        for step in trace:
+            action = step.get("action")
+            ts = step.get("timestamp")
+            prefix = f"[{ts}] " if ts else ""
+            if action == "start":
+                lines.append(
+                    f"{prefix}Старт – профил {step.get('profile')} | потребител: {step.get('username')}"
+                )
+            elif action == "detected_mode":
+                lines.append(
+                    f"{prefix}Открит режим: {step.get('mode')} ({step.get('name')})"
+                )
+            elif action == "procedure_attempt":
+                lines.append(
+                    f"{prefix}Процедура ({step.get('mode')}): {step.get('procedure')}"
+                )
+            elif action == "procedure_result":
+                lines.append(f"{prefix}Процедура – редове: {step.get('rows')}")
+            elif action == "procedure_error":
+                lines.append(f"{prefix}Грешка при процедура: {step.get('error')}")
+            elif action == "procedure_switch":
+                lines.append(
+                    f"{prefix}Превключване от {step.get('from')} към {step.get('to')}"
+                )
+            elif action == "table_attempt":
+                lines.append(
+                    f"{prefix}Таблица ({step.get('mode')}): {step.get('table')}"
+                )
+            elif action == "table_result":
+                lines.append(f"{prefix}Таблица – редове: {step.get('rows')}")
+            elif action == "table_error":
+                lines.append(f"{prefix}Грешка при таблица: {step.get('error')}")
+            elif action == "success":
+                lines.append(
+                    f"{prefix}Успех – оператор ID {step.get('operator_id')} ({step.get('operator_login')})"
+                )
+            elif action == "failure":
+                lines.append(f"{prefix}Неуспех – {step.get('message')}")
+            else:
+                lines.append(f"{prefix}{action}: {step}")
+        if not lines:
+            lines.append("Няма налични данни за диагностика.")
+        return lines
+
+    def _show_login_diagnostics(self) -> None:
+        trace = self.last_login_trace or db_integration.last_login_trace(self.session)
+        if not trace:
+            try:
+                messagebox.showinfo("Диагностика", "Няма налични данни от последния опит.")
+            except Exception:
+                pass
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Диагностика на входа")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(True, True)
+
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        text = tk.Text(frame, width=80, height=18, wrap="word")
+        text.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(frame, command=text.yview)
+        scrollbar.pack(side="right", fill="y")
+        text.configure(yscrollcommand=scrollbar.set)
+
+        lines = self._format_login_trace(trace)
+        text.insert("1.0", "\n".join(lines))
+        text.configure(state="disabled")
+
+        ttk.Button(dialog, text="Затвори", command=dialog.destroy).pack(pady=(4, 0))
+        dialog.bind("<Escape>", lambda _e: dialog.destroy())
+
     def _on_profile_change(self, _evt: Optional[tk.Event] = None) -> None:
         name = self.profile_cmb.get()
         if not name:
@@ -249,9 +345,12 @@ class MicroVisionApp:
         self.session.username = ""
         self.session.user_id = None
         self.session.raw_login_payload = None
+        self.session.last_login_trace = None
+        self.last_login_trace = []
         self.username_var.set("")
         self.password_var.set("")
         self.login_status_var.set("Вход: няма активна сесия.")
+        self._toggle_login_diag_button(False)
 
     def _on_get_machine_id(self) -> None:
         mid = machine_id()
@@ -302,7 +401,17 @@ class MicroVisionApp:
             return
 
         if isinstance(result, dict) and result.get("error"):
-            self._log(f"❌ {result['error']}")
+            message = str(result.get("error"))
+            trace = result.get("trace") or db_integration.last_login_trace(self.session)
+            self.last_login_trace = trace or []
+            self.session.last_login_trace = self.last_login_trace
+            self.login_status_var.set("Вход: неуспешен.")
+            self._log(f"❌ {message}")
+            self._toggle_login_diag_button(bool(self.last_login_trace))
+            try:
+                messagebox.showerror("Вход", message)
+            except Exception:
+                pass
             return
         if not result:
             self._log("❌ Невалидни данни за вход.")
@@ -317,12 +426,15 @@ class MicroVisionApp:
         self.session.username = effective_username
         self.session.user_id = user_id
         self.session.raw_login_payload = result
+        self.last_login_trace = db_integration.last_login_trace(self.session)
+        self.session.last_login_trace = self.last_login_trace
 
         display_user = effective_username or ("само парола" if not username else username)
         suffix = f" (ID: {user_id})" if user_id is not None else ""
         self.login_status_var.set(f"Вход: {display_user}{suffix}")
         self._log(f"✅ Успешен вход: {display_user}{suffix}")
         self.password_var.set("")
+        self._toggle_login_diag_button(False)
         self._refresh_license_text()
 
     def _legacy_login_bridge(self, username: str, password: str) -> Optional[Dict[str, Any]]:
@@ -448,17 +560,29 @@ class MicroVisionApp:
             self._report_error("Неуспешен експорт в TXT.", exc)
 
     def _refresh_license_text(self) -> None:
-        if validate_license is None:
+        license_file = Path(__file__).with_name("license.json")
+        if not license_file.exists():
             self.license_var.set("Лиценз: проверка недостъпна")
+            logger.warning("Лиценз файлът липсва: %s", license_file)
             return
         try:
-            remaining = validate_license()
-            if remaining is None:
-                raise ValueError("Няма информация за оставащи дни")
-            self.license_var.set(f"Лиценз: оставащи {remaining} дни")
+            with license_file.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            valid_until = data.get("valid_until")
+            if not valid_until:
+                raise ValueError("Липсва поле valid_until")
+            expiry = datetime.fromisoformat(str(valid_until)).date()
+            today = datetime.now().date()
+            remaining = (expiry - today).days
+            if remaining < 0:
+                self.license_var.set("Лиценз: изтекъл")
+            else:
+                self.license_var.set(f"Лиценз: оставащи {remaining} дни")
+        except FileNotFoundError:
+            self.license_var.set("Лиценз: проверка недостъпна")
         except Exception as exc:
             logger.exception("Грешка при проверка на лиценза: %s", exc)
-            self.license_var.set("Лиценз: грешка при проверка")
+            self.license_var.set("Лиценз: проверка недостъпна")
 
 
 # -------------------------

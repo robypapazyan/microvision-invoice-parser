@@ -5,12 +5,12 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from loguru import logger
-
 from mistral_db import (  # type: ignore[attr-defined]
     MistralDBError,
     connect,
     create_open_delivery,
+    get_last_login_trace,
+    logger,
     login_user,
     push_items_to_mistral,
     _require_cursor,
@@ -139,7 +139,9 @@ def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
         _ensure_connection(session, profile_label, profile)
     except MistralDBError as exc:
         logger.error("Грешка при подготовка за логин: %s", exc)
-        return {"error": str(exc)}
+        trace = get_last_login_trace()
+        session.last_login_trace = trace
+        return {"error": str(exc), "trace": trace}
 
     logger.info(
         "Опит за логин (профил: %s, потребител: %s)",
@@ -166,9 +168,13 @@ def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
                     profile_label,
                     retry_exc,
                 )
-                return {"error": str(retry_exc)}
+                trace = get_last_login_trace()
+                session.last_login_trace = trace
+                return {"error": str(retry_exc), "trace": trace}
         else:
-            return {"error": message}
+            trace = get_last_login_trace()
+            session.last_login_trace = trace
+            return {"error": message, "trace": trace}
 
     session.profile_label = profile_label
     logger.info(
@@ -177,6 +183,8 @@ def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
         operator_login,
         operator_id,
     )
+    trace = get_last_login_trace()
+    session.last_login_trace = trace
     return {"user_id": operator_id, "login": operator_login}
 
 
@@ -192,6 +200,15 @@ def start_open_delivery(session: Any) -> int:
     delivery_id = create_open_delivery(int(operator_id))
     session.open_delivery_id = delivery_id
     return delivery_id
+
+
+def last_login_trace(session: Any | None = None) -> List[Dict[str, Any]]:
+    trace = None
+    if session is not None:
+        trace = getattr(session, "last_login_trace", None)
+    if isinstance(trace, list):
+        return trace
+    return get_last_login_trace()
 
 
 def push_parsed_rows(session: Any, rows: List[Dict[str, Any]]) -> None:

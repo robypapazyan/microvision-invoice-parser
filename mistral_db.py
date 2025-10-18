@@ -2,14 +2,90 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 from contextlib import contextmanager
 from datetime import datetime, date
 from decimal import Decimal, ROUND_HALF_UP
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from loguru import logger
+try:  # pragma: no cover - loguru е предпочитан, но не задължителен
+    from loguru import logger as _loguru_logger
+except ImportError:  # pragma: no cover - fallback към logging
+    _loguru_logger = None  # type: ignore
+
+
+_LOG_CONFIGURED = False
+_CONN: Any | None = None
+_CUR: Any | None = None
+_PROFILE: Dict[str, Any] | None = None
+_PROFILE_LABEL: str | None = None
+_LOGIN_META: Dict[str, Any] | None = None
+_DELIVERY_TABLES: Dict[str, str] | None = None
+_DELIVERY_GENERATORS: Dict[str, Optional[str]] | None = None
+_TABLE_COLUMNS: Dict[str, Dict[str, Dict[str, Any]]] = {}
+_DELIVERY_CONTEXT: Dict[int, Dict[str, Any]] = {}
+_LOGIN_TRACE: List[Dict[str, Any]] = []
+
+
+if _loguru_logger is not None:
+    logger = _loguru_logger
+else:  # pragma: no cover - при липса на loguru
+    logger = logging.getLogger("microvision")
+
+
+def _configure_logging() -> None:
+    global _LOG_CONFIGURED
+    if _LOG_CONFIGURED:
+        return
+
+    log_dir = Path(__file__).resolve().parent / "logs"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:  # pragma: no cover - защитно
+        pass
+
+    log_level_name = os.getenv("MICROVISION_LOG_LEVEL", "INFO").upper() or "INFO"
+    log_file = log_dir / "app_{time:YYYYMMDD}.log"
+
+    if _loguru_logger is not None:
+        try:
+            logger.add(
+                log_file,
+                rotation="5 MB",
+                retention="7 files",
+                level=log_level_name,
+                encoding="utf-8",
+            )
+        except Exception:  # pragma: no cover - ако loguru е вече конфигуриран
+            pass
+    else:  # pragma: no cover - logging fallback
+        level = getattr(logging, log_level_name, logging.INFO)
+        logger.setLevel(logging.DEBUG)
+        handler = RotatingFileHandler(
+            log_dir / f"app_{datetime.now():%Y%m%d}.log",
+            maxBytes=5 * 1024 * 1024,
+            backupCount=7,
+            encoding="utf-8",
+        )
+        handler.setLevel(level)
+        formatter = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        handler.setFormatter(formatter)
+        if not any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
+            logger.addHandler(handler)
+        logger.propagate = False
+        logger.setLevel(level)
+
+    _LOG_CONFIGURED = True
+
+
+_configure_logging()
+
 
 try:  # предпочитаме fdb (поддържа Firebird 2.5)
     import fdb  # type: ignore
@@ -27,33 +103,6 @@ except ImportError:  # pragma: no cover - fallback към firebird-driver
         raise ImportError(
             "Не е открит Firebird драйвер. Инсталирайте 'fdb' или 'firebird-driver'."
         ) from exc
-
-
-if not _LOG_CONFIGURED:
-    log_dir = Path(__file__).resolve().parent / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_level = os.getenv("MICROVISION_LOG_LEVEL", "INFO").upper() or "INFO"
-    logger.add(
-        log_dir / "app_{time:YYYYMMDD}.log",
-        rotation="5 MB",
-        retention="7 files",
-        level=log_level,
-        encoding="utf-8",
-    )
-    _LOG_CONFIGURED = True
-
-
-_LOG_CONFIGURED = False
-_CONN: Any | None = None
-_CUR: Any | None = None
-_PROFILE: Dict[str, Any] | None = None
-_PROFILE_LABEL: str | None = None
-_LOGIN_META: Dict[str, Any] | None = None
-_DELIVERY_TABLES: Dict[str, str] | None = None
-_DELIVERY_GENERATORS: Dict[str, Optional[str]] | None = None
-_TABLE_COLUMNS: Dict[str, Dict[str, Dict[str, Any]]] = {}
-_DELIVERY_CONTEXT: Dict[int, Dict[str, Any]] = {}
-_LOGIN_TRACE: List[Dict[str, Any]] = []
 
 
 class MistralDBError(RuntimeError):
@@ -293,9 +342,12 @@ def _match_password(
             candidate = _hash_with_algo(plain, salt, algo)
             if candidate.lower() == stored_str.lower():
                 return True, False
-    unknown = "HASH" in field_name.upper() and all(
-        algo in {"MD5", "SHA1", "SHA256"} for algo in algos if algo != "PLAIN"
-    )
+    looks_hex = all(c in "0123456789abcdefABCDEF" for c in stored_str)
+    unknown = bool(salts_clean)
+    if not unknown and looks_hex and len(stored_str) not in {32, 40, 64}:
+        unknown = True
+    if not unknown and "HASH" in field_name.upper():
+        unknown = True
     return False, unknown
 
 
@@ -491,7 +543,21 @@ def detect_login_method(cur: Any | None = None) -> Dict[str, Any]:
         if not cols:
             continue
         upper_map = {col.upper(): col for col in cols}
-        has_name = "NAME" in upper_map
+        login_candidates = (
+            "NAME",
+            "LOGIN",
+            "USERNAME",
+            "USER_NAME",
+            "CODE",
+            "USERCODE",
+            "OPERATOR",
+        )
+        login_col = None
+        for candidate in login_candidates:
+            if candidate in upper_map:
+                login_col = upper_map[candidate]
+                break
+        has_name = login_col is not None
         has_pass = "PASS" in upper_map
         if not has_pass:
             continue
@@ -502,17 +568,24 @@ def detect_login_method(cur: Any | None = None) -> Dict[str, Any]:
                 break
         if not id_col:
             continue
+        salt_col = None
+        for candidate in ("SALT", "PASS_SALT", "PASSWORD_SALT", "SALT1"):
+            if candidate in upper_map:
+                salt_col = upper_map[candidate]
+                break
         entry = {
             "mode": "table",
             "name": table_name,
             "sp_kind": None,
             "fields": {
                 "id": id_col,
-                "login": upper_map.get("NAME"),
+                "login": login_col,
                 "password": upper_map["PASS"],
+                "salt": salt_col,
                 "has_name": has_name,
                 "has_pass": has_pass,
             },
+            "columns": cols,
         }
         table_candidates.append(entry)
 
@@ -544,10 +617,29 @@ def login_user(username: str, password: str) -> Tuple[int, str]:
     _record_login_step(
         {"action": "start", "profile": _profile_label(), "username": username or "<само парола>"}
     )
+    logger.info(
+        "Старт на логин (профил: %s, потребител: %s)",
+        _profile_label(),
+        username or "<само парола>",
+    )
 
     if _LOGIN_META is None:
         _LOGIN_META = detect_login_method(cur)
     meta = _LOGIN_META
+
+    _record_login_step(
+        {
+            "action": "detected_mode",
+            "mode": meta.get("mode"),
+            "name": meta.get("name"),
+            "sp_kind": meta.get("sp_kind"),
+        }
+    )
+    logger.info(
+        "Използван механизъм за логин: %s (%s)",
+        meta.get("mode"),
+        meta.get("name"),
+    )
 
     try:
         if meta.get("mode") == "sp":
@@ -820,65 +912,119 @@ def _login_via_table(meta: Dict[str, Any], username: str, password: str) -> Tupl
         id_col = fields.get("id")
         login_col = fields.get("login")
         pass_col = fields.get("password")
+        salt_col = fields.get("salt")
         if not (table and id_col and pass_col):
             continue
-        use_username = bool(username and login_col)
-        if use_username:
-            sql = f"SELECT {id_col}, {login_col} FROM {table} WHERE {login_col} = ? AND {pass_col} = ?"
-            params: Tuple[Any, ...] = (username, password)
+
+        base_select = [f"{id_col} AS ID_FIELD"]
+        if login_col:
+            base_select.append(f"COALESCE({login_col}, '') AS LOGIN_FIELD")
         else:
-            extra = f", {login_col}" if login_col else ""
-            sql = f"SELECT {id_col}{extra} FROM {table} WHERE {pass_col} = ?"
-            params = (password,)
-        _record_login_step(
-            {
-                "action": "table_attempt",
-                "table": table,
-                "mode": "username+password" if use_username else "password-only",
-                "sql": sql,
-                "params": {
-                    "username": username if use_username else None,
-                    "password": "***" if password else "",
-                },
-            }
-        )
-        logger.info(
-            "Login чрез таблица %s (%s режим).",
-            table,
-            "потребител+парола" if use_username else "само парола",
-        )
-        try:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
-        except _FB_ERROR as exc:
+            base_select.append("'' AS LOGIN_FIELD")
+        base_select.append(f"{pass_col} AS PASS_FIELD")
+        if salt_col:
+            base_select.append(f"{salt_col} AS SALT_FIELD")
+        select_clause = ", ".join(base_select)
+
+        use_username = bool(username and login_col)
+
+        hashed_variants = []
+        if not use_username:
+            try:
+                hashed_variants = list(
+                    dict.fromkeys(
+                        _hash_with_algo(password, None, algo)
+                        for algo in ("PLAIN", "MD5", "SHA1", "SHA256")
+                    )
+                )
+            except ValueError:
+                hashed_variants = [password]
+
+        queries: List[Tuple[str, Sequence[Any], str]] = []
+        where_parts: List[str] = []
+        params: List[Any] = []
+        if use_username:
+            where_parts.append(f"UPPER({login_col}) = UPPER(?)")
+            params.append(username)
+        if not use_username and hashed_variants:
+            placeholders = ", ".join(["?"] * len(hashed_variants))
+            where_parts.append(f"{pass_col} IN ({placeholders})")
+            params.extend(hashed_variants)
+        sql = f"SELECT {select_clause} FROM {table}"
+        if where_parts:
+            sql += " WHERE " + " AND ".join(where_parts)
+        queries.append((sql, tuple(params), "filtered" if where_parts else "full"))
+
+        if not use_username and salt_col:
+            # За salted хешове може да се наложи пълен скан
+            scan_sql = f"SELECT {select_clause} FROM {table}"
+            queries.append((scan_sql, tuple(), "scan"))
+
+        unknown_algorithms = False
+        for query_sql, query_params, mode in queries:
             _record_login_step(
                 {
-                    "action": "table_error",
+                    "action": "table_attempt",
                     "table": table,
-                    "error": str(exc),
+                    "mode": "username+password" if use_username else "password-only",
+                    "sql": query_sql,
+                    "params": {
+                        "username": username if use_username else None,
+                        "password": "***" if password else "",
+                        "query_mode": mode,
+                    },
                 }
             )
-            raise MistralDBError(f"Грешка при четене от {table}: {exc}") from exc
-
-        row_count = len(rows)
-        _record_login_step({"action": "table_result", "table": table, "rows": row_count})
-        logger.debug("Запитване към %s върна %s ред(а).", table, row_count)
-
-        if row_count == 0:
-            continue
-        if row_count > 1:
-            raise MistralDBError(
-                "Намерени са няколко оператора с тази парола. Моля, попълнете и потребителско име."
+            logger.info(
+                "Login чрез таблица %s (%s режим, заявка: %s).",
+                table,
+                "потребител+парола" if use_username else "само парола",
+                mode,
             )
-        row = rows[0]
-        operator_id = int(row[0])
-        operator_login = (
-            str(row[1]).strip()
-            if use_username and len(row) > 1 and row[1] is not None
-            else (username or str(operator_id))
-        )
-        meta["name"] = table
-        return operator_id, operator_login
+            try:
+                cur.execute(query_sql, query_params)
+                rows = cur.fetchall()
+            except _FB_ERROR as exc:
+                _record_login_step(
+                    {
+                        "action": "table_error",
+                        "table": table,
+                        "error": str(exc),
+                    }
+                )
+                raise MistralDBError(f"Грешка при четене от {table}: {exc}") from exc
+
+            row_count = len(rows)
+            _record_login_step({"action": "table_result", "table": table, "rows": row_count})
+            logger.debug(
+                "Запитване към %s (%s) върна %s ред(а).", table, mode, row_count
+            )
+
+            if row_count == 0:
+                continue
+            if use_username and row_count > 5:
+                logger.warning(
+                    "Намерени са повече от 5 реда за потребител %s в %s.", username, table
+                )
+
+            columns = [desc[0].strip().upper() for desc in cur.description]
+            for row in rows:
+                data = dict(zip(columns, row))
+                stored_pass = data.get("PASS_FIELD")
+                salts = [data.get("SALT_FIELD")] if "SALT_FIELD" in data else []
+                match, unknown = _match_password(password, stored_pass, salts, pass_col)
+                if match:
+                    operator_id = int(data.get("ID_FIELD"))
+                    operator_login = str(data.get("LOGIN_FIELD") or "").strip() or (
+                        username if use_username else str(operator_id)
+                    )
+                    meta["name"] = table
+                    return operator_id, operator_login
+                if unknown:
+                    unknown_algorithms = True
+
+        if unknown_algorithms:
+            raise MistralDBError("Нужна е информация за алгоритъма на паролите.")
 
     raise MistralDBError("Невалиден потребител или парола")
 
