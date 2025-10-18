@@ -8,13 +8,12 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List
 
-from loguru import logger
-
 from mistral_db import (  # type: ignore[attr-defined]
     MistralDBError,
     connect,
     detect_login_method,
     get_last_login_trace,
+    logger,
     login_user,
 )
 
@@ -59,17 +58,54 @@ def pick_profile(profiles: Dict[str, Dict[str, Any]], name: str | None) -> tuple
     return first_key, profiles[first_key]
 
 
-def describe_meta(meta: Dict[str, Any]) -> str:
+def _format_field(field: Dict[str, Any]) -> str:
+    name = field.get("name") or "?"
+    type_name = field.get("type_name") or "?"
+    position = field.get("position")
+    if position is not None:
+        return f"[{position}] {name} – {type_name}"
+    return f"{name} – {type_name}"
+
+
+def print_meta(meta: Dict[str, Any]) -> None:
     mode = meta.get("mode")
     if mode == "sp":
-        return f"Процедура {meta.get('name')} ({meta.get('sp_kind')})"
-    if mode == "table":
-        fields = meta.get("fields", {})
         name = meta.get("name")
-        has_name = "да" if fields.get("has_name") else "не"
-        has_pass = "да" if fields.get("has_pass") else "не"
-        return f"Таблица {name} (NAME: {has_name}, PASS: {has_pass})"
-    return "Непознат режим"
+        sp_kind = meta.get("sp_kind")
+        print(f"Открит login механизъм: ПРОЦЕДУРА {name} ({sp_kind})")
+        fields = meta.get("fields", {})
+        inputs = fields.get("inputs") or []
+        outputs = fields.get("outputs") or []
+        if inputs:
+            print("  Вход параметри:")
+            for field in inputs:
+                print(f"    - {_format_field(field)}")
+        if outputs:
+            print("  Изход параметри:")
+            for field in outputs:
+                print(f"    - {_format_field(field)}")
+        return
+
+    if mode == "table":
+        table_name = meta.get("name")
+        fields = meta.get("fields", {})
+        print(f"Открит login механизъм: ТАБЛИЦА {table_name}")
+        print("  Използвани полета:")
+        print(f"    - ID: {fields.get('id')}")
+        print(f"    - LOGIN: {fields.get('login') or '—'}")
+        print(f"    - PASSWORD: {fields.get('password')}")
+        print(f"    - SALT: {fields.get('salt') or '—'}")
+        columns = meta.get("columns") or {}
+        if columns:
+            print("  Достъпни колони:")
+            for name, info in columns.items():
+                print(f"    - {name}: {info.get('type_name')}")
+        candidates = [c.get("name") for c in meta.get("candidates", []) if c.get("name")]
+        if candidates:
+            print("  Алтернативни таблици: " + ", ".join(candidates))
+        return
+
+    print("Открит механизъм: непознат режим")
 
 
 def print_trace(trace: List[Dict[str, Any]]) -> None:
@@ -80,52 +116,58 @@ def print_trace(trace: List[Dict[str, Any]]) -> None:
     print("\nХронология на опита:")
     for step in trace:
         action = step.get("action")
+        ts = step.get("timestamp")
+        prefix = f"[{ts}] " if ts else ""
         if action == "start":
             print(
-                f"- Старт: профил {step.get('profile')} | потребител: {step.get('username')}"
+                f"- {prefix}Старт: профил {step.get('profile')} | потребител: {step.get('username')}"
+            )
+        elif action == "detected_mode":
+            print(
+                f"- {prefix}Открит режим: {step.get('mode')} ({step.get('name')})"
             )
         elif action == "procedure_attempt":
             mode = step.get("mode")
             params = step.get("params", {})
             print(
-                f"- Процедура ({mode}): {step.get('procedure')} | SQL: {step.get('sql')}"
+                f"- {prefix}Процедура ({mode}): {step.get('procedure')} | SQL: {step.get('sql')}"
             )
             print(
                 f"    параметри: потребител={params.get('username')} парола={params.get('password')}"
             )
         elif action == "procedure_switch":
             print(
-                f"- Превключване от {step.get('from')} към {step.get('to')} (причина: {step.get('reason')})"
+                f"- {prefix}Превключване от {step.get('from')} към {step.get('to')} (причина: {step.get('reason')})"
             )
         elif action == "procedure_error":
             print(
-                f"- Грешка при процедура ({step.get('mode')}): {step.get('procedure')} -> {step.get('error')}"
+                f"- {prefix}Грешка при процедура ({step.get('mode')}): {step.get('procedure')} -> {step.get('error')}"
             )
         elif action == "procedure_result":
             print(
-                f"- Резултат процедура ({step.get('mode')}): {step.get('procedure')} | редове: {step.get('rows')}"
+                f"- {prefix}Резултат процедура ({step.get('mode')}): {step.get('procedure')} | редове: {step.get('rows')}"
             )
         elif action == "procedure_callproc":
-            print(f"- Опит за callproc: {step.get('procedure')}")
+            print(f"- {prefix}Опит за callproc: {step.get('procedure')}")
         elif action == "table_attempt":
             params = step.get("params", {})
             print(
-                f"- Таблица ({step.get('mode')}): {step.get('table')} | SQL: {step.get('sql')}"
+                f"- {prefix}Таблица ({step.get('mode')}): {step.get('table')} | SQL: {step.get('sql')}"
             )
             print(
                 f"    параметри: потребител={params.get('username')} парола={params.get('password')}"
             )
         elif action == "table_error":
-            print(f"- Грешка при таблица {step.get('table')}: {step.get('error')}")
+            print(f"- {prefix}Грешка при таблица {step.get('table')}: {step.get('error')}")
         elif action == "table_result":
-            print(f"- Резултат от таблица {step.get('table')}: {step.get('rows')} ред(а)")
+            print(f"- {prefix}Резултат от таблица {step.get('table')}: {step.get('rows')} ред(а)")
         elif action == "success":
             print(
-                f"- Успех: оператор ID={step.get('operator_id')} login={step.get('operator_login')}"
+                f"- {prefix}Успех: оператор ID={step.get('operator_id')} login={step.get('operator_login')}"
             )
         elif action == "failure":
-            print(f"- Неуспех: {step.get('message')}")
-
+            print(f"- {prefix}Неуспех: {step.get('message')}")
+        
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Диагностика на Mistral login.")
@@ -161,11 +203,13 @@ def main() -> None:
         conn.close()
         raise SystemExit(f"Откриване на логин механизъм: НЕУСПЕШНО – {exc}")
 
-    print(f"Открит login режим: {describe_meta(meta)}")
-    if meta.get("mode") == "table":
-        candidates = [c.get("name") for c in meta.get("candidates", []) if c.get("name")]
-        if candidates:
-            print("Възможни таблици: " + ", ".join(candidates))
+    print_meta(meta)
+
+    if args.user or args.password:
+        user_display = args.user if args.user else "<празно>"
+        print(f"\nТестов вход с потребител='{user_display}'")
+    else:
+        print("\nТестов вход без потребителско име (само парола)")
 
     result_text = ""
     try:
