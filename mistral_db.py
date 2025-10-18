@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover - fallback към firebird-driver
 _CONN: Any | None = None
 _CUR: Any | None = None
 _PROFILE: Dict[str, Any] | None = None
+_PROFILE_LABEL: str | None = None
 _LOGIN_META: Dict[str, Any] | None = None
 _DELIVERY_TABLES: Dict[str, str] | None = None
 _DELIVERY_GENERATORS: Dict[str, Optional[str]] | None = None
@@ -39,24 +40,41 @@ class MistralDBError(RuntimeError):
     """Базово контролирано изключение."""
 
 
-class AuthenticationError(MistralDBError):
-    """Логинът е неуспешен."""
-
-
 class UnsupportedAuthSchema(MistralDBError):
     """Непозната auth схема."""
 
 
+def _profile_label() -> str:
+    profile = _PROFILE or {}
+    for key in ("label", "name", "client", "profile", "profile_name"):
+        value = profile.get(key)
+        if value:
+            return str(value)
+    if _PROFILE_LABEL:
+        return _PROFILE_LABEL
+    database = profile.get("database")
+    if database:
+        return str(database)
+    return "неизвестен"
+
+
 def _require_connection() -> Any:
     if _CONN is None:
-        raise MistralDBError("Няма активна връзка към Mistral. Извикайте connect(profile).")
+        raise MistralDBError(
+            f"Няма активна връзка – опитайте отново (профил: {_profile_label()})."
+        )
     return _CONN
 
 
-def _require_cursor() -> Any:
-    if _CUR is None:
-        raise MistralDBError("Няма активен курсор. Извикайте connect(profile).")
-    return _CUR
+def _require_cursor(
+    conn: Any | None = None, cur: Any | None = None, profile_label: str | None = None
+) -> Any:
+    label = profile_label or _profile_label()
+    active_conn = conn if conn is not None else _CONN
+    active_cur = cur if cur is not None else _CUR
+    if not active_conn or not active_cur:
+        raise MistralDBError(f"Няма активна връзка – опитайте отново (профил: {label}).")
+    return active_cur
 
 
 @contextmanager
@@ -308,22 +326,37 @@ def _ensure_delivery_generators(cur: Any) -> Tuple[Optional[str], Optional[str]]
 
 def connect(profile: Dict[str, Any]) -> Tuple[Any, Any]:
     """Установява връзка към Firebird и връща (connection, cursor)."""
-    global _CONN, _CUR, _PROFILE, _LOGIN_META
+    global _CONN, _CUR, _PROFILE, _PROFILE_LABEL, _LOGIN_META
     if "database" not in profile:
         raise MistralDBError("В профила липсва ключ 'database'.")
+
     host = profile.get("host", "localhost")
     port = int(profile.get("port", 3050))
     database = profile["database"]
     user = profile.get("user", "SYSDBA")
     password = profile.get("password", "masterkey")
-    charset = profile.get("charset", "WIN1251")
+    charset = profile.get("charset", "WIN1251") or "WIN1251"
 
-    conn = _connect_raw(host, port, database, user, password, charset)
-    cur = conn.cursor()
+    profile_label = str(
+        profile.get("label")
+        or profile.get("name")
+        or profile.get("client")
+        or profile.get("profile_name")
+        or database
+    )
+
+    try:
+        conn = _connect_raw(host, port, database, user, password, charset)
+        cur = conn.cursor()
+    except Exception as exc:  # pragma: no cover - защитно
+        raise MistralDBError(
+            f"Грешка при свързване към база (профил: {profile_label}). Проверете хост/порт/права."
+        ) from exc
 
     _CONN = conn
     _CUR = cur
     _PROFILE = dict(profile)
+    _PROFILE_LABEL = profile_label
     _LOGIN_META = None
     _DELIVERY_TABLES = None
     _DELIVERY_GENERATORS = None
@@ -333,7 +366,11 @@ def connect(profile: Dict[str, Any]) -> Tuple[Any, Any]:
 
 
 def detect_login_method(cur: Any) -> Dict[str, Any]:
-    """Открива дали се ползва LOGIN процедура или USER(S) таблица."""
+    """Открива дали се ползва LOGIN процедура или USERS/LOGUSERS."""
+
+    profile_label = _profile_label()
+    cur = _require_cursor(_CONN, cur, profile_label)
+
     cur.execute(
         """
         SELECT TRIM(p.rdb$procedure_name), COALESCE(p.rdb$procedure_type, 2)
@@ -345,7 +382,9 @@ def detect_login_method(cur: Any) -> Dict[str, Any]:
     )
     procs = cur.fetchall()
     for name, proc_type in procs:
-        pcur = _require_connection().cursor()
+        conn = getattr(cur, "connection", None) or _require_connection()
+        pcur = conn.cursor()
+        pcur = _require_cursor(conn, pcur, profile_label)
         pcur.execute(
             """
             SELECT
@@ -388,46 +427,50 @@ def detect_login_method(cur: Any) -> Dict[str, Any]:
                 },
             }
 
-    # fallback: таблица USERS/USER/OPERATORS
-    cur.execute(
-        """
-        SELECT TRIM(r.rdb$relation_name)
-        FROM rdb$relations r
-        WHERE r.rdb$view_blr IS NULL
-          AND COALESCE(r.rdb$system_flag, 0) = 0
-          AND UPPER(r.rdb$relation_name) LIKE '%USER%'
-        ORDER BY 1
-        """
-    )
-    login_cols = {"CODE", "LOGIN", "USERNAME", "USER_NAME", "NAME", "KOD", "OPERATOR"}
-    pass_cols = {"PASS", "PASSWORD", "PAROLA", "PASS_HASH", "PAROLA_HASH", "PWD"}
-    salt_cols = {"SALT"}
-    id_cols = {"ID", "USER_ID", "OP_ID", "KOD", "CODE"}
-    for (table_name,) in cur.fetchall():
+    table_candidates: List[Dict[str, Any]] = []
+    for table_name in ("USERS", "LOGUSERS"):
         cols = _table_columns(table_name)
-        names = {name.upper() for name in cols}
-        ids = [c for c in cols if c.upper() in id_cols]
-        passes = [c for c in cols if c.upper() in pass_cols]
-        logins = [c for c in cols if c.upper() in login_cols]
-        salts = [c for c in cols if c.upper() in salt_cols]
-        if ids and passes:
-            return {
-                "mode": "table",
-                "name": table_name,
-                "fields": {
-                    "id": ids[0],
-                    "login": logins[0] if logins else None,
-                    "passwords": passes,
-                    "salts": salts,
-                },
-            }
+        if not cols:
+            continue
+        upper_map = {col.upper(): col for col in cols}
+        if "NAME" not in upper_map or "PASS" not in upper_map:
+            continue
+        id_col = None
+        for candidate in ("ID", "CODE", "KOD", "USER_ID", "OP_ID"):
+            if candidate in upper_map:
+                id_col = upper_map[candidate]
+                break
+        if not id_col:
+            continue
+        entry = {
+            "mode": "table",
+            "name": table_name,
+            "fields": {
+                "id": id_col,
+                "login": upper_map["NAME"],
+                "passwords": [upper_map["PASS"]],
+                "salts": [],
+            },
+        }
+        table_candidates.append(entry)
+
+    if table_candidates:
+        primary = {
+            "mode": "table",
+            "name": table_candidates[0]["name"],
+            "fields": dict(table_candidates[0]["fields"]),
+            "candidates": table_candidates,
+        }
+        return primary
+
     raise UnsupportedAuthSchema(
         "Не успях да открия механизъм за логин. Нужна е допълнителна конфигурация."
     )
 
 
 def login_user(username: str, password: str) -> Tuple[int, str]:
-    """Връща (operator_id, operator_login) или вдига AuthenticationError."""
+    """Връща (operator_id, operator_login) или вдига MistralDBError."""
+
     global _LOGIN_META
     cur = _require_cursor()
     if _LOGIN_META is None:
@@ -468,7 +511,7 @@ def _login_via_procedure(meta: Dict[str, Any], username: str, password: str) -> 
     except _FB_ERROR as exc:
         raise MistralDBError(f"Грешка при изпълнение на {name}: {exc}") from exc
     if not row:
-        raise AuthenticationError("Невалиден потребител или парола")
+        raise MistralDBError("Невалиден потребител или парола")
     outputs = meta["fields"].get("outputs", [])
     operator_id: Optional[int] = None
     operator_login: Optional[str] = None
@@ -495,33 +538,64 @@ def _login_via_procedure(meta: Dict[str, Any], username: str, password: str) -> 
             ) from exc
     if operator_login is None:
         operator_login = username or (str(row[1]).strip() if len(row) > 1 else str(operator_id))
+    if operator_id is None:
+        raise MistralDBError("Невалиден потребител или парола")
     return operator_id, operator_login
 
 
 def _login_via_table(meta: Dict[str, Any], username: str, password: str) -> Tuple[int, str]:
+    candidates = meta.get("candidates") or [meta]
+    last_unknown = False
+    for candidate in candidates:
+        result, unknown = _login_via_table_candidate(candidate, username, password)
+        if result is not None:
+            return result
+        last_unknown = last_unknown or unknown
+    if last_unknown:
+        raise UnsupportedAuthSchema(
+            "Паролата е записана с непознат алгоритъм. Нужна е допълнителна информация."
+        )
+    raise MistralDBError("Невалиден потребител или парола")
+
+
+def _login_via_table_candidate(
+    meta: Dict[str, Any], username: str, password: str
+) -> Tuple[Optional[Tuple[int, str]], bool]:
     table = meta["name"]
-    fields = meta["fields"]
-    id_col = fields["id"]
+    fields = meta.get("fields", {})
+    id_col = fields.get("id")
     login_col = fields.get("login")
     pass_cols = fields.get("passwords", [])
     salt_cols = fields.get("salts", [])
-    if not pass_cols:
-        raise UnsupportedAuthSchema("Таблицата за потребители няма колона за парола.")
+    if not (id_col and pass_cols):
+        return None, False
+
     select_cols = [id_col]
     if login_col:
         select_cols.append(login_col)
     select_cols.extend(pass_cols)
     select_cols.extend(salt_cols)
+
     cur = _require_cursor()
+
     def _fetch_all() -> List[Tuple[Any, ...]]:
-        cur.execute(f"SELECT {', '.join(select_cols)} FROM {table}")
-        return cur.fetchall()
+        try:
+            cur.execute(f"SELECT {', '.join(select_cols)} FROM {table}")
+            return cur.fetchall()
+        except _FB_ERROR as exc:
+            raise MistralDBError(f"Грешка при четене от {table}: {exc}") from exc
 
     def _fetch_by_login(login_value: str) -> Optional[Tuple[Any, ...]]:
         if not login_col:
             return None
-        sql = f"SELECT {', '.join(select_cols)} FROM {table} WHERE UPPER({login_col}) = UPPER(?)"
-        cur.execute(sql, (login_value,))
+        sql = (
+            f"SELECT {', '.join(select_cols)} FROM {table} "
+            f"WHERE UPPER({login_col}) = UPPER(?)"
+        )
+        try:
+            cur.execute(sql, (login_value,))
+        except _FB_ERROR as exc:
+            raise MistralDBError(f"Грешка при проверка на {table}: {exc}") from exc
         return cur.fetchone()
 
     salts_idx_start = 1 + (1 if login_col else 0) + len(pass_cols)
@@ -530,7 +604,7 @@ def _login_via_table(meta: Dict[str, Any], username: str, password: str) -> Tupl
     if username:
         row = _fetch_by_login(username)
         if not row:
-            raise AuthenticationError("Невалиден потребител или парола")
+            return None, False
         user_id = int(row[0])
         login_value = str(row[1]) if login_col and row[1] is not None else username
         pass_values = row[1 + (1 if login_col else 0) : 1 + (1 if login_col else 0) + len(pass_cols)]
@@ -539,15 +613,10 @@ def _login_via_table(meta: Dict[str, Any], username: str, password: str) -> Tupl
         for field_name, stored_value in zip(pass_cols, pass_values):
             matched, unknown = _match_password(password, stored_value, salt_values, field_name)
             if matched:
-                return user_id, login_value
+                return (user_id, str(login_value).strip() or username), False
             unknown_algo = unknown_algo or unknown
-        if unknown_algo:
-            raise UnsupportedAuthSchema(
-                "Паролата изглежда хеширана в непознат формат. Свържете се с поддръжка."
-            )
-        raise AuthenticationError("Невалиден потребител или парола")
+        return None, unknown_algo
 
-    # password-only режим – търсим уникален мач
     rows = _fetch_all()
     matches: List[Tuple[int, str]] = []
     unknown_any = False
@@ -562,13 +631,13 @@ def _login_via_table(meta: Dict[str, Any], username: str, password: str) -> Tupl
                 matches.append((user_id, login_value or str(user_id)))
                 break
             unknown_any = unknown_any or unknown
-    if unknown_any and not matches:
-        raise UnsupportedAuthSchema(
-            "Паролата е записана с непознат алгоритъм. Нужна е допълнителна информация."
+    if len(matches) > 1:
+        raise MistralDBError(
+            "Намерени са няколко оператора с тази парола. Моля, попълнете и потребителско име."
         )
     if len(matches) == 1:
-        return matches[0]
-    raise AuthenticationError("Невалиден потребител или парола")
+        return matches[0], False
+    return None, unknown_any
 
 
 def get_item_info(code_or_name: str) -> Optional[Dict[str, Any]]:
@@ -849,12 +918,12 @@ class MistralDB:  # pragma: no cover - thin wrapper за обратна съвм
         try:
             operator_id, _ = login_user(login, password)
             return operator_id
-        except AuthenticationError:
+        except MistralDBError:
             return None
 
     def authenticate_operator_password_only(self, password: str) -> Optional[int]:
         try:
             operator_id, _ = login_user("", password)
             return operator_id
-        except AuthenticationError:
+        except MistralDBError:
             return None
