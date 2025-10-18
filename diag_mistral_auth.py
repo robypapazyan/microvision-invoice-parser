@@ -1,18 +1,14 @@
-"""Диагностичен скрипт за откриване на Mistral login механизма."""
+"""Диагностика на Mistral login механизма."""
 from __future__ import annotations
 
 import json
 from pathlib import Path
 from typing import Any, Dict, List
 
-from mistral_db import connect, MistralDBError
+from mistral_db import MistralDBError, connect
 
 
 PROFILE_FILE = Path(__file__).with_name("mistral_clients.json")
-
-LOGIN_HINTS = {"LOGIN", "USERNAME", "USER_NAME", "CODE", "KOD", "NAME", "OPERATOR"}
-PASS_HINTS = {"PASS", "PASSWORD", "PAROLA", "PASS_HASH", "PAROLA_HASH", "PWD"}
-ID_HINTS = {"ID", "USER_ID", "OP_ID", "CODE", "KOD"}
 
 
 def _field_type_name(
@@ -58,9 +54,20 @@ def _load_profile() -> Dict[str, Any]:
         raise SystemExit("Липсва mistral_clients.json – няма как да се изпълни диагностиката.")
     with PROFILE_FILE.open("r", encoding="utf-8") as fh:
         data = json.load(fh)
-    if not isinstance(data, list) or not data:
-        raise SystemExit("mistral_clients.json трябва да съдържа поне един профил.")
-    return data[0]
+    if isinstance(data, dict):
+        if not data:
+            raise SystemExit("mistral_clients.json е празен.")
+        first_key = next(iter(data))
+        profile = data[first_key]
+        if not isinstance(profile, dict):
+            raise SystemExit("Профилът трябва да е описан като обект.")
+        return profile
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                return item
+        raise SystemExit("Списъкът с профили не съдържа валиден запис.")
+    raise SystemExit("mistral_clients.json е в неочакван формат (list или dict са допустими).")
 
 
 def _print_header(title: str) -> None:
@@ -68,44 +75,8 @@ def _print_header(title: str) -> None:
     print("=" * len(title))
 
 
-def _fetch_procedure_params(cur: Any, name: str) -> List[Dict[str, Any]]:
-    q = cur.connection.cursor()
-    q.execute(
-        """
-        SELECT
-            COALESCE(pp.rdb$parameter_type, 0) AS param_type,
-            TRIM(pp.rdb$parameter_name) AS param_name,
-            COALESCE(pp.rdb$parameter_number, 0) AS param_number,
-            f.rdb$field_type,
-            f.rdb$field_sub_type,
-            f.rdb$field_length,
-            f.rdb$field_precision,
-            f.rdb$field_scale,
-            f.rdb$character_length
-        FROM rdb$procedure_parameters pp
-        JOIN rdb$fields f ON f.rdb$field_name = pp.rdb$field_source
-        WHERE pp.rdb$procedure_name = ?
-        ORDER BY param_type, param_number
-        """,
-        (name,),
-    )
-    rows = q.fetchall()
-    q.close()
-    params: List[Dict[str, Any]] = []
-    for row in rows:
-        params.append(
-            {
-                "type": "IN" if row[0] == 0 else "OUT",
-                "name": row[1],
-                "order": int(row[2]),
-                "type_name": _field_type_name(row[3], row[4], row[5], row[6], row[7], row[8]),
-            }
-        )
-    return params
-
-
 def _print_login_procedures(cur: Any) -> None:
-    print("\nПроцедури с 'LOGIN' в името:")
+    print("\nПроцедури, съдържащи 'LOGIN' в името:")
     cur.execute(
         """
         SELECT TRIM(p.rdb$procedure_name), COALESCE(p.rdb$procedure_type, 2)
@@ -117,24 +88,43 @@ def _print_login_procedures(cur: Any) -> None:
     )
     rows = cur.fetchall()
     if not rows:
-        print("  (няма намерени процедури)")
+        print("  (не са открити подходящи процедури)")
         return
     for name, proc_type in rows:
-        params = _fetch_procedure_params(cur, name)
         call_type = "SELECTABLE" if proc_type == 1 else "EXECUTE"
         print(f"- {name} [{call_type}]")
-        ins = [p for p in params if p["type"] == "IN"]
-        outs = [p for p in params if p["type"] == "OUT"]
+        cur.execute(
+            """
+            SELECT
+                COALESCE(pp.rdb$parameter_type, 0) AS param_type,
+                TRIM(pp.rdb$parameter_name) AS param_name,
+                COALESCE(pp.rdb$parameter_number, 0) AS param_number,
+                f.rdb$field_type,
+                f.rdb$field_sub_type,
+                f.rdb$field_length,
+                f.rdb$field_precision,
+                f.rdb$field_scale,
+                f.rdb$character_length
+            FROM rdb$procedure_parameters pp
+            JOIN rdb$fields f ON f.rdb$field_name = pp.rdb$field_source
+            WHERE pp.rdb$procedure_name = ?
+            ORDER BY param_type, param_number
+            """,
+            (name,),
+        )
+        params = cur.fetchall()
+        ins = [p for p in params if p[0] == 0]
+        outs = [p for p in params if p[0] != 0]
         if ins:
             print("    Входни параметри:")
-            for param in ins:
-                print(f"      • {param['name']} : {param['type_name']}")
+            for row in ins:
+                print(f"      • {row[1]} : {_field_type_name(row[3], row[4], row[5], row[6], row[7], row[8])}")
         else:
             print("    Входни параметри: (няма)")
         if outs:
             print("    Изходни параметри:")
-            for param in outs:
-                print(f"      • {param['name']} : {param['type_name']}")
+            for row in outs:
+                print(f"      • {row[1]} : {_field_type_name(row[3], row[4], row[5], row[6], row[7], row[8])}")
         else:
             print("    Изходни параметри: (няма)")
 
@@ -170,41 +160,33 @@ def _fetch_table_columns(cur: Any, table: str) -> List[Dict[str, Any]]:
     return result
 
 
-def _print_user_tables(cur: Any) -> None:
-    print("\nТаблици със записи за потребители:")
-    cur.execute(
-        """
-        SELECT TRIM(r.rdb$relation_name)
-        FROM rdb$relations r
-        WHERE r.rdb$view_blr IS NULL
-          AND COALESCE(r.rdb$system_flag, 0) = 0
-          AND UPPER(r.rdb$relation_name) LIKE '%USER%'
-        ORDER BY 1
-        """
-    )
-    tables = [row[0] for row in cur.fetchall()]
-    if not tables:
-        print("  (няма намерени кандидат-таблици)")
+def _print_table_info(cur: Any, table: str) -> None:
+    print(f"\nТаблица {table}:")
+    columns = _fetch_table_columns(cur, table)
+    if not columns:
+        print("  Таблицата не е открита или няма колони.")
         return
+    has_name = any(col["name"].upper() == "NAME" for col in columns)
+    has_pass = any(col["name"].upper() == "PASS" for col in columns)
+    print(f"  Има колона NAME: {'да' if has_name else 'не'}")
+    print(f"  Има колона PASS: {'да' if has_pass else 'не'}")
+    print("  Колони:")
+    for col in columns:
+        required = []
+        if col["name"].upper() == "NAME":
+            required.append("← NAME")
+        if col["name"].upper() == "PASS":
+            required.append("← PASS")
+        label = f" ({', '.join(required)})" if required else ""
+        nullable = "NOT NULL" if col["not_null"] else "NULLABLE"
+        print(f"    • {col['name']} : {col['type_name']} [{nullable}]{label}")
 
-    for table in tables:
-        cols = _fetch_table_columns(cur, table)
-        login_cols = [c for c in cols if c["name"].upper() in LOGIN_HINTS]
-        pass_cols = [c for c in cols if c["name"].upper() in PASS_HINTS]
-        id_cols = [c for c in cols if c["name"].upper() in ID_HINTS]
-        if not pass_cols or not id_cols:
-            continue
-        print(f"- {table}:")
-        if id_cols:
-            joined = ", ".join(f"{c['name']} ({c['type_name']})" for c in id_cols)
-            print(f"    ID колони: {joined}")
-        if login_cols:
-            joined = ", ".join(f"{c['name']} ({c['type_name']})" for c in login_cols)
-            print(f"    Колони за потребител: {joined}")
-        else:
-            print("    Колони за потребител: (не са намерени – вероятен login само по парола)")
-        joined = ", ".join(f"{c['name']} ({c['type_name']})" for c in pass_cols)
-        print(f"    Колони за парола: {joined}")
+
+def _print_sample_queries() -> None:
+    print("\nПримерни SELECT заявки, използвани от логин модула:")
+    print("  - SELECT ID, NAME FROM USERS WHERE NAME=? AND PASS=?")
+    print("  - SELECT ID, NAME FROM LOGUSERS WHERE NAME=? AND PASS=?")
+    print("  - (само парола) SELECT ID, NAME FROM <TABLE> WHERE PASS=?")
 
 
 def main() -> None:
@@ -212,20 +194,14 @@ def main() -> None:
     try:
         conn, cur = connect(profile)
     except MistralDBError as exc:
-        raise SystemExit(f"Неуспешна връзка към Mistral: {exc}")
+        raise SystemExit(f"Неуспешно свързване: {exc}")
 
-    _print_header("Диагностика на Mistral (автентикация)")
+    label = profile.get("name") or profile.get("label") or profile.get("client") or profile.get("database")
+    _print_header(f"Профил: {label}")
     _print_login_procedures(cur)
-    _print_user_tables(cur)
-
-    try:
-        cur.close()
-    except Exception:
-        pass
-    try:
-        conn.close()
-    except Exception:
-        pass
+    _print_table_info(cur, "USERS")
+    _print_table_info(cur, "LOGUSERS")
+    _print_sample_queries()
 
 
 if __name__ == "__main__":

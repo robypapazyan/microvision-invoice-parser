@@ -1,51 +1,184 @@
-# db_integration.py
+"""Интеграционен слой между GUI и Mistral DB."""
 from __future__ import annotations
-from typing import Optional, Tuple, Dict, Any
+
 import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
-from mistral_db import MistralDB, DBConfig
-
-
-def _make_db(profile: Dict[str, Any]) -> MistralDB:
-    conf = DBConfig(
-        database=profile["database"],
-        host=profile.get("host", "localhost"),
-        port=int(profile.get("port", 3050)),
-        user=profile.get("user", "SYSDBA"),
-        password=profile.get("password", "masterkey"),
-        charset=profile.get("charset", "WIN1251"),
-    )
-    return MistralDB(conf, profile.get("auth", {}))
+from mistral_db import (  # type: ignore[attr-defined]
+    MistralDBError,
+    connect,
+    create_open_delivery,
+    login_user,
+    push_items_to_mistral,
+    _require_cursor,
+)
 
 
-# --- AUTH bridge (GUI -> MistralDB) ---
-from mistral_db import DBConfig, MistralDB
+_CLIENTS_FILE = Path(__file__).with_name("mistral_clients.json")
+_PROFILE_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
 
-def operator_login_session(profile: dict, login: str | None, password: str) -> int | None:
-    """
-    Връща user_id при успех, иначе None.
-    - ако login е None/празно -> логин само с парола (password-only)
-    - иначе -> логин с login + парола
-    """
-    # Профилните ключове са по твоя JSON (mistral_clients.json)
-    conf = DBConfig(
-        database = profile.get("database"),
-        host     = profile.get("host", "localhost"),
-        port     = int(profile.get("port", 3050)),
-        user     = profile.get("user", "SYSDBA"),
-        password = profile.get("password", "masterkey"),
-        charset  = profile.get("charset", "WIN1251"),
-    )
 
-    db = MistralDB(conf)
+def _profile_label_from_profile(profile: Dict[str, Any], fallback: Optional[str] = None) -> str:
+    for key in ("label", "name", "client", "profile", "profile_name"):
+        value = profile.get(key)
+        if value:
+            return str(value)
+    if fallback:
+        return fallback
+    database = profile.get("database")
+    if database:
+        return str(database)
+    return "неизвестен"
 
-    # Нормализирай login: празен стринг -> None
-    if login is not None and str(login).strip() == "":
-        login = None
 
-    if login is None:
-        # password-only (изисква уникален мач)
-        return db.authenticate_operator_password_only(password)
+def _load_profiles() -> Dict[str, Dict[str, Any]]:
+    global _PROFILE_CACHE
+    if _PROFILE_CACHE is not None:
+        return _PROFILE_CACHE
+
+    if not _CLIENTS_FILE.exists():
+        raise MistralDBError("Липсва mistral_clients.json – няма как да се осъществи връзка.")
+
+    try:
+        with _CLIENTS_FILE.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except json.JSONDecodeError as exc:  # pragma: no cover - защитно
+        raise MistralDBError("mistral_clients.json съдържа невалиден JSON.") from exc
+
+    profiles: Dict[str, Dict[str, Any]] = {}
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(value, dict):
+                profiles[str(key)] = value
+    elif isinstance(data, list):
+        for idx, item in enumerate(data):
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name") or item.get("client") or item.get("profile") or item.get("label")
+            if not name:
+                name = f"Профил {idx + 1}"
+            profiles[str(name)] = item
     else:
-        # класически login + password
-        return db.authenticate_operator(login, password)
+        raise MistralDBError("mistral_clients.json е в неочакван формат (очаква се list или dict).")
+
+    if not profiles:
+        raise MistralDBError("В mistral_clients.json няма валидно описани профили.")
+
+    _PROFILE_CACHE = profiles
+    return profiles
+
+
+def _load_profile(profile_key: str) -> Dict[str, Any]:
+    profiles = _load_profiles()
+    if profile_key in profiles:
+        return profiles[profile_key]
+    raise MistralDBError(f"Профил '{profile_key}' не е намерен в mistral_clients.json.")
+
+
+def _resolve_profile(session: Any) -> Tuple[str, Dict[str, Any]]:
+    profile_label = getattr(session, "profile_name", None) or getattr(session, "profile_label", None)
+    profile: Optional[Dict[str, Any]] = getattr(session, "profile_data", None)
+
+    if profile_label and (not profile or not isinstance(profile, dict)):
+        profile = _load_profile(str(profile_label))
+
+    if not profile_label:
+        if profile:
+            profile_label = _profile_label_from_profile(profile)
+        else:
+            raise MistralDBError("Липсва избран профил за връзка към база.")
+
+    if not profile or not isinstance(profile, dict):
+        profile = _load_profile(str(profile_label))
+
+    session.profile_label = str(profile_label)
+    session.profile_data = profile
+    return str(profile_label), profile
+
+
+def initialize_session(session: Any, profile_key: str) -> Tuple[Any, Any]:
+    profile = _load_profile(profile_key)
+    conn, cur = connect(profile)
+    session.conn = conn
+    session.cur = cur
+    session.profile_label = profile_key
+    session.profile_data = profile
+    return conn, cur
+
+
+def _ensure_connection(session: Any, profile_label: str, profile: Dict[str, Any]) -> Tuple[Any, Any]:
+    conn = getattr(session, "conn", None)
+    cur = getattr(session, "cur", None)
+    if conn is not None and cur is not None:
+        try:
+            _require_cursor(conn, cur, profile_label)
+            return conn, cur
+        except MistralDBError:
+            pass
+
+    conn, cur = connect(profile)
+    session.conn = conn
+    session.cur = cur
+    session.profile_label = profile_label
+    session.profile_data = profile
+    return conn, cur
+
+
+def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
+    username = username or ""
+    password = password or ""
+    try:
+        profile_label, profile = _resolve_profile(session)
+        _ensure_connection(session, profile_label, profile)
+    except MistralDBError as exc:
+        return {"error": str(exc)}
+
+    try:
+        operator_id, operator_login = login_user(username, password)
+    except MistralDBError as exc:
+        message = str(exc)
+        if "Няма активна връзка" in message:
+            try:
+                _ensure_connection(session, profile_label, profile)
+                operator_id, operator_login = login_user(username, password)
+            except MistralDBError as retry_exc:
+                return {"error": str(retry_exc)}
+        else:
+            return {"error": message}
+
+    session.profile_label = profile_label
+    return {"user_id": operator_id, "login": operator_login}
+
+
+def start_open_delivery(session: Any) -> int:
+    profile_label, profile = _resolve_profile(session)
+    _ensure_connection(session, profile_label, profile)
+    _require_cursor()
+
+    operator_id = getattr(session, "user_id", None)
+    if operator_id is None:
+        raise MistralDBError("Липсва оператор за OPEN доставка.")
+
+    delivery_id = create_open_delivery(int(operator_id))
+    session.open_delivery_id = delivery_id
+    return delivery_id
+
+
+def push_parsed_rows(session: Any, rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        return
+
+    profile_label, profile = _resolve_profile(session)
+    _ensure_connection(session, profile_label, profile)
+    _require_cursor()
+
+    delivery_id = getattr(session, "open_delivery_id", None)
+    if delivery_id is None:
+        operator_id = getattr(session, "user_id", None)
+        if operator_id is None:
+            raise MistralDBError("Липсват активна доставка и оператор за запис на редовете.")
+        delivery_id = create_open_delivery(int(operator_id))
+        session.open_delivery_id = delivery_id
+
+    push_items_to_mistral(int(delivery_id), rows)

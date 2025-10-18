@@ -280,16 +280,24 @@ class MicroVisionApp:
             self._report_error("Грешка при опит за вход. Опитайте отново.", exc)
             return
 
+        if isinstance(result, dict) and result.get("error"):
+            self._log(f"❌ {result['error']}")
+            return
         if not result:
             self._log("❌ Невалидни данни за вход.")
             return
 
+        login_name = ""
+        if isinstance(result, dict):
+            login_name = str(result.get("login") or "").strip()
+
         user_id = self._extract_user_id(result)
-        self.session.username = username
+        effective_username = login_name or username
+        self.session.username = effective_username
         self.session.user_id = user_id
         self.session.raw_login_payload = result
 
-        display_user = username if username else "само парола"
+        display_user = effective_username or ("само парола" if not username else username)
         suffix = f" (ID: {user_id})" if user_id is not None else ""
         self.login_status_var.set(f"Вход: {display_user}{suffix}")
         self._log(f"✅ Успешен вход: {display_user}{suffix}")
