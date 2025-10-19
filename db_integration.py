@@ -1,14 +1,21 @@
 """Интеграционен слой между GUI и Mistral DB."""
 from __future__ import annotations
 
+import csv
 import json
+import os
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from mistral_db import (  # type: ignore[attr-defined]
     MistralDBError,
     connect,
     create_open_delivery,
+    db_find_by_barcode,
+    db_find_by_code,
+    db_find_by_name_like,
+    db_resolve_item,
     get_last_login_trace,
     logger,
     login_user,
@@ -19,6 +26,352 @@ from mistral_db import (  # type: ignore[attr-defined]
 
 _CLIENTS_FILE = Path(__file__).with_name("mistral_clients.json")
 _PROFILE_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
+_MATERIALS_FILE = Path(__file__).with_name("materials.csv")
+_MAPPING_FILE = Path(__file__).with_name("mapping.json")
+
+_MATERIALS_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
+_MATERIALS_BY_BARCODE: Optional[Dict[str, Dict[str, Any]]] = None
+_MAPPING_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
+
+
+def _normalize_token(value: str | None) -> str:
+    value = value or ""
+    collapsed = " ".join(value.split())
+    return collapsed.lower()
+
+
+def _ensure_decimal(value: Any, default: Decimal) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    if value in (None, ""):
+        return default
+    try:
+        return Decimal(str(value).replace(" ", "").replace(",", "."))
+    except (InvalidOperation, ValueError):
+        return default
+
+
+def _load_materials() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    global _MATERIALS_CACHE, _MATERIALS_BY_BARCODE
+    if _MATERIALS_CACHE is not None and _MATERIALS_BY_BARCODE is not None:
+        return _MATERIALS_CACHE, _MATERIALS_BY_BARCODE
+
+    materials: Dict[str, Dict[str, Any]] = {}
+    materials_by_barcode: Dict[str, Dict[str, Any]] = {}
+    if not _MATERIALS_FILE.exists():
+        logger.debug("materials.csv липсва – fallback ще бъде ограничен.")
+        _MATERIALS_CACHE = materials
+        _MATERIALS_BY_BARCODE = materials_by_barcode
+        return materials, materials_by_barcode
+
+    try:
+        with _MATERIALS_FILE.open("r", encoding="cp1251", errors="ignore") as fh:
+            reader = csv.DictReader(fh, delimiter=";")
+            for row in reader:
+                code = str(row.get("Номер") or row.get("code") or "").strip()
+                name = str(row.get("Име на материал") or row.get("name") or "").strip()
+                barcode = str(row.get("Баркод") or row.get("barcode") or "").strip()
+                purchase_price = row.get("Последна покупна цена") or row.get("purchase_price")
+                sale_price = row.get("Продажна цена") or row.get("sale_price")
+                if not code:
+                    continue
+                material = {
+                    "code": code,
+                    "name": name,
+                    "barcode": barcode or None,
+                    "purchase_price": purchase_price,
+                    "sale_price": sale_price,
+                }
+                materials[code] = material
+                if barcode:
+                    materials_by_barcode[barcode] = material
+    except Exception as exc:
+        logger.warning("Неуспешно зареждане на materials.csv: %s", exc)
+
+    _MATERIALS_CACHE = materials
+    _MATERIALS_BY_BARCODE = materials_by_barcode
+    return materials, materials_by_barcode
+
+
+def _load_mapping() -> Dict[str, Dict[str, Any]]:
+    global _MAPPING_CACHE
+    if _MAPPING_CACHE is not None:
+        return _MAPPING_CACHE
+
+    mapping: Dict[str, Dict[str, Any]] = {}
+    if not _MAPPING_FILE.exists():
+        logger.debug("mapping.json липсва – fallback ще бъде ограничен.")
+        _MAPPING_CACHE = mapping
+        return mapping
+
+    try:
+        with _MAPPING_FILE.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if not isinstance(value, dict):
+                    continue
+                mapping[_normalize_token(str(key))] = value
+    except Exception as exc:
+        logger.warning("Неуспешно зареждане на mapping.json: %s", exc)
+
+    _MAPPING_CACHE = mapping
+    return mapping
+
+
+def _extract_token_from_row(row: Dict[str, Any]) -> str:
+    for key in ("token", "barcode", "code", "name", "description"):
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _fallback_from_material(code: str) -> Optional[Dict[str, Any]]:
+    materials, _ = _load_materials()
+    material = materials.get(code)
+    if not material:
+        return None
+    return {
+        "id": None,
+        "code": material.get("code"),
+        "name": material.get("name"),
+        "barcode": material.get("barcode"),
+        "source": "mapping",
+        "match": "code",
+        "purchase_price": material.get("purchase_price"),
+        "sale_price": material.get("sale_price"),
+    }
+
+
+def _fallback_match(row: Dict[str, Any], token: str) -> Optional[Dict[str, Any]]:
+    token_norm = _normalize_token(token)
+    if not token_norm:
+        return None
+
+    materials, materials_by_barcode = _load_materials()
+    if token in materials_by_barcode:
+        candidate = materials_by_barcode[token]
+        return {
+            "id": None,
+            "code": candidate.get("code"),
+            "name": candidate.get("name"),
+            "barcode": candidate.get("barcode"),
+            "source": "mapping",
+            "match": "barcode",
+            "purchase_price": candidate.get("purchase_price"),
+            "sale_price": candidate.get("sale_price"),
+        }
+
+    mapping = _load_mapping()
+    entry = mapping.get(token_norm)
+    if entry and isinstance(entry, dict):
+        mapped_code = str(entry.get("code") or "").strip()
+        mapped_name = str(entry.get("name") or "").strip()
+        candidate = _fallback_from_material(mapped_code)
+        if candidate:
+            candidate["name"] = candidate.get("name") or mapped_name
+            candidate["match"] = candidate.get("match") or "mapping"
+            return candidate
+        if mapped_code:
+            return {
+                "id": None,
+                "code": mapped_code,
+                "name": mapped_name,
+                "barcode": None,
+                "source": "mapping",
+                "match": "mapping",
+            }
+
+    if token in materials:
+        candidate = _fallback_from_material(token)
+        if candidate:
+            candidate["match"] = candidate.get("match") or "code"
+        return candidate
+
+    return None
+
+
+def _extract_numeric(row: Dict[str, Any], keys: Iterable[str], default: Decimal) -> Decimal:
+    for key in keys:
+        if key not in row:
+            continue
+        value = row.get(key)
+        result = _ensure_decimal(value, default)
+        if result != default or value in ("0", 0, 0.0):
+            return result
+    return default
+
+
+def _finalize_candidate(
+    row: Dict[str, Any], candidate: Dict[str, Any], source: str
+) -> Dict[str, Any]:
+    qty = _extract_numeric(
+        row,
+        (
+            "qty",
+            "quantity",
+            "Количество",
+            "Кол-во",
+            "count",
+        ),
+        Decimal("1"),
+    )
+    price = _extract_numeric(
+        row,
+        (
+            "price",
+            "unit_price",
+            "purchase_price",
+            "Ед. цена",
+            "Цена",
+        ),
+        Decimal("0"),
+    )
+    vat = _extract_numeric(row, ("vat", "dds", "VAT"), Decimal("0"))
+    sale_price = row.get("sale_price") or row.get("Продажна цена")
+    sale_price_decimal = _ensure_decimal(sale_price, Decimal("0")) if sale_price is not None else None
+
+    final_item = {
+        "material_id": candidate.get("id"),
+        "code": candidate.get("code") or row.get("code"),
+        "name": candidate.get("name") or row.get("name"),
+        "qty": qty,
+        "price": price,
+        "vat": vat,
+        "barcode": candidate.get("barcode") or row.get("barcode"),
+        "sale_price": sale_price_decimal,
+        "source": source,
+        "match_kind": candidate.get("match"),
+    }
+    return final_item
+
+
+def apply_candidate_choice(row: Dict[str, Any], candidate: Dict[str, Any], source: str) -> Dict[str, Any]:
+    final_item = _finalize_candidate(row, candidate, source)
+    row["resolved"] = dict(candidate)
+    row["resolved"]["source"] = source
+    row["final_item"] = final_item
+    return row
+
+
+def resolve_items_from_db(session: Any, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not rows:
+        return []
+
+    use_db = os.getenv("MV_USE_DB_ITEMS", "1").strip() != "0"
+    stats = {
+        "total": len(rows),
+        "db": 0,
+        "mapping": 0,
+        "unresolved": 0,
+        "multi": 0,
+    }
+
+    cur = getattr(session, "cur", None) if use_db else None
+    resolved_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        working = dict(row)
+        token = _extract_token_from_row(working)
+        working.setdefault("token", token)
+        working.pop("resolved", None)
+        working.pop("final_item", None)
+
+        candidates: List[Dict[str, Any]] = []
+        if use_db and token:
+            try:
+                candidates = db_resolve_item(cur, token)
+            except MistralDBError as exc:
+                logger.error("Грешка при търсене в базата: %s", exc)
+                candidates = []
+        if len(candidates) == 1:
+            apply_candidate_choice(working, candidates[0], candidates[0].get("source", "db"))
+            stats["db"] += 1
+            logger.info(
+                "DB resolve: еднозначно съвпадение → token=%s → код=%s",
+                token,
+                working["final_item"].get("code"),
+            )
+        elif len(candidates) > 1:
+            working["resolved"] = {"candidates": candidates}
+            stats["multi"] += 1
+            logger.info(
+                "DB resolve: multiple (%s) → need user decision",
+                len(candidates),
+            )
+        else:
+            fallback_candidate = _fallback_match(working, token)
+            if fallback_candidate:
+                apply_candidate_choice(working, fallback_candidate, fallback_candidate.get("source", "mapping"))
+                stats["mapping"] += 1
+                logger.info(
+                    "DB resolve: fallback mapping → token=%s → код=%s",
+                    token,
+                    working["final_item"].get("code"),
+                )
+            else:
+                working["resolved"] = None
+                working["final_item"] = None
+                stats["unresolved"] += 1
+                logger.info("DB resolve: no match → unresolved → token=%s", token)
+
+        resolved_rows.append(working)
+
+    session.last_resolution_stats = stats
+    return resolved_rows
+
+
+def collect_db_diagnostics(session: Any) -> Dict[str, Any]:
+    profile_label, profile = _resolve_profile(session)
+    conn, cur = _ensure_connection(session, profile_label, profile)
+    active_cur = _require_cursor(conn, cur, profile_label)
+    diagnostics: Dict[str, Any] = {"profile": profile_label}
+
+    try:
+        active_cur.execute("SELECT COUNT(*) FROM MATERIAL")
+        diagnostics["materials_count"] = active_cur.fetchone()[0]
+    except Exception as exc:
+        diagnostics["materials_error"] = str(exc)
+
+    try:
+        active_cur.execute("SELECT COUNT(*) FROM BARCODE")
+        diagnostics["barcode_count"] = active_cur.fetchone()[0]
+    except Exception as exc:
+        diagnostics["barcode_error"] = str(exc)
+
+    try:
+        active_cur.execute(
+            "SELECT FIRST 1 b.BARCODE FROM BARCODE b WHERE b.BARCODE IS NOT NULL"
+        )
+        barcode_row = active_cur.fetchone()
+        if barcode_row and barcode_row[0]:
+            sample_barcode = str(barcode_row[0]).strip()
+            diagnostics["sample_barcode"] = sample_barcode
+            diagnostics["sample_barcode_matches"] = db_find_by_barcode(active_cur, sample_barcode)
+    except Exception as exc:
+        diagnostics["sample_barcode_error"] = str(exc)
+
+    try:
+        active_cur.execute(
+            "SELECT FIRST 1 m.CODE, mn.NAME FROM MATERIAL m "
+            "LEFT JOIN MATERIALNAME mn ON mn.MATERIAL = m.ID AND mn.ISDEFAULT = 1 "
+            "WHERE m.CODE IS NOT NULL ORDER BY m.CODE"
+        )
+        row = active_cur.fetchone()
+        if row:
+            code_sample = str(row[0]).strip()
+            name_sample = str(row[1] or "").strip()
+            diagnostics["sample_code"] = code_sample
+            diagnostics["sample_name"] = name_sample
+            diagnostics["sample_code_matches"] = db_find_by_code(active_cur, code_sample)
+            if name_sample:
+                diagnostics["sample_name_matches"] = db_find_by_name_like(
+                    active_cur, name_sample, limit=3
+                )
+    except Exception as exc:
+        diagnostics["sample_material_error"] = str(exc)
+
+    return diagnostics
 
 
 def _profile_label_from_profile(profile: Dict[str, Any], fallback: Optional[str] = None) -> str:

@@ -93,6 +93,72 @@ class SessionState:
 
 
 
+class CandidateDialog(tk.Toplevel):
+    """Диалог за избор между няколко артикула."""
+
+    def __init__(self, parent: tk.Tk, token: str, candidates: List[str]) -> None:
+        super().__init__(parent)
+        self.result: Optional[int | str] = None
+        self.title("Избор на артикул")
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="Разпознат текст:", font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        token_box = tk.Text(frame, height=2, width=50, wrap="word", relief="groove", borderwidth=1)
+        token_box.pack(fill="x", pady=(0, 8))
+        token_box.insert("1.0", token)
+        token_box.configure(state="disabled")
+
+        ttk.Label(frame, text="Изберете правилния артикул:").pack(anchor="w")
+        self.listbox = tk.Listbox(frame, height=min(6, len(candidates)), exportselection=False)
+        self.listbox.pack(fill="both", expand=True, pady=(4, 8))
+        for entry in candidates:
+            self.listbox.insert(tk.END, entry)
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x")
+        self.select_btn = ttk.Button(btns, text="Избери", command=self._on_select, state="disabled")
+        self.select_btn.pack(side="left")
+        ttk.Button(btns, text="Пропусни", command=self._on_skip).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="Отказ", command=self._on_cancel).pack(side="right")
+
+        self.listbox.bind("<<ListboxSelect>>", self._on_listbox_change)
+        self.listbox.bind("<Double-Button-1>", lambda _e: self._on_select())
+        self.bind("<Return>", lambda _e: self._on_select())
+        self.bind("<Escape>", lambda _e: self._on_cancel())
+
+    def _on_listbox_change(self, _evt: tk.Event) -> None:
+        if self.listbox.curselection():
+            self.select_btn.state(["!disabled"])
+        else:
+            self.select_btn.state(["disabled"])
+
+    def _on_select(self) -> None:
+        selection = self.listbox.curselection()
+        if not selection:
+            return
+        self.result = int(selection[0])
+        self.destroy()
+
+    def _on_skip(self) -> None:
+        self.result = "skip"
+        self.destroy()
+
+    def _on_cancel(self) -> None:
+        self.result = "cancel"
+        self.destroy()
+
+    def show(self) -> Optional[int | str]:
+        self.wait_window()
+        return self.result
+
+
+
 # -------------------------
 # Помощни функции
 # -------------------------
@@ -161,6 +227,9 @@ class MicroVisionApp:
         self.active_profile_name: Optional[str] = None
         self.rows_cache: List[Dict[str, Any]] = []
         self.last_login_trace: List[Dict[str, Any]] = []
+        self.status_summary_var = tk.StringVar(
+            value="Редове: 0 | намерени в БД: 0 | чрез mapping: 0 | неразрешени: 0"
+        )
 
         self._build_ui()
         self.session.db_mode = bool(self.db_mode_var.get())
@@ -250,6 +319,7 @@ class MicroVisionApp:
         status = ttk.Frame(self.root, padding=(16, 4, 16, 12))
         status.pack(side="bottom", fill="x")
         ttk.Button(status, text="Отвори логове", command=self._on_open_logs).pack(side="left")
+        ttk.Label(status, textvariable=self.status_summary_var).pack(side="left", padx=(12, 0))
         ttk.Label(status, textvariable=self.license_var, foreground="#555").pack(side="right")
 
     def _log(self, text: str) -> None:
@@ -370,6 +440,51 @@ class MicroVisionApp:
             summary_lines = [line for line in stdout.splitlines() if line.strip()][:5]
         if not summary_lines:
             summary_lines = ["Няма налично обобщение от диагностиката."]
+
+        diag_fn = getattr(db_integration, "collect_db_diagnostics", None)
+        if callable(diag_fn):
+            try:
+                diag_info = diag_fn(self.session)
+                diag_lines: List[str] = []
+                materials_count = diag_info.get("materials_count")
+                if materials_count is not None:
+                    diag_lines.append(f"Материали в БД: {materials_count}")
+                elif diag_info.get("materials_error"):
+                    diag_lines.append(f"Материали: грешка ({diag_info['materials_error']})")
+                barcode_count = diag_info.get("barcode_count")
+                if barcode_count is not None:
+                    diag_lines.append(f"Баркодове: {barcode_count}")
+                elif diag_info.get("barcode_error"):
+                    diag_lines.append(f"Баркодове: грешка ({diag_info['barcode_error']})")
+
+                sample_barcode = diag_info.get("sample_barcode")
+                sample_barcode_matches = diag_info.get("sample_barcode_matches") or []
+                if sample_barcode and sample_barcode_matches:
+                    match = sample_barcode_matches[0]
+                    diag_lines.append(
+                        f"Пример баркод {sample_barcode} → {match.get('code') or '—'} | {match.get('name') or 'без име'}"
+                    )
+
+                sample_code = diag_info.get("sample_code")
+                sample_code_matches = diag_info.get("sample_code_matches") or []
+                if sample_code and sample_code_matches:
+                    match = sample_code_matches[0]
+                    diag_lines.append(
+                        f"Пример код {sample_code} → {match.get('name') or 'без име'}"
+                    )
+
+                sample_name = diag_info.get("sample_name")
+                sample_name_matches = diag_info.get("sample_name_matches") or []
+                if sample_name and sample_name_matches:
+                    first_name = sample_name_matches[0]
+                    diag_lines.append(
+                        f"Пример име '{sample_name}' → {first_name.get('code') or '—'}"
+                    )
+
+                summary_lines.append("--- DB диагностика ---")
+                summary_lines.extend(diag_lines or ["Няма налични данни за диагностика на БД."])
+            except Exception as exc:
+                summary_lines.append(f"DB диагностика: неуспешно ({exc})")
 
         self._log("📋 Обобщение от диагностика:")
         for item in summary_lines:
@@ -575,32 +690,133 @@ class MicroVisionApp:
             self._log("⚠️ Върнатият резултат не е списък с редове.")
             return
 
+        resolver = getattr(db_integration, "resolve_items_from_db", None)
+        if callable(resolver):
+            rows = resolver(self.session, rows)
+        else:
+            self._log("⚠️ Липсва DB резолвер – използвам суровите редове.")
+
         self.rows_cache = rows
         count = len(rows)
         if count == 0:
             self._log("ℹ️ Няма разпознати редове в документа.")
+            self._update_status_summary(rows)
+            return
+
+        if not self._resolve_candidate_dialogs(rows):
+            self._update_status_summary(rows)
+            return
+
+        self._update_status_summary(rows)
+        self._log(f"✅ Разпознати редове: {count}")
+        self._preview_rows(rows)
+
+        final_items = [row.get("final_item") for row in rows if row.get("final_item")]
+
+        if self.session.db_mode and final_items:
+            self._push_to_open_delivery(final_items)
+
+        if final_items:
+            self._offer_export(final_items, file_path)
         else:
-            self._log(f"✅ Разпознати редове: {count}")
-            self._preview_rows(rows)
+            self._log("⚠️ Няма потвърдени артикули за експорт/доставка.")
 
-        if self.session.db_mode and count:
-            self._push_to_open_delivery(rows)
+    def _update_status_summary(self, rows: List[Dict[str, Any]]) -> None:
+        total = len(rows)
+        db_count = 0
+        mapping_count = 0
+        for row in rows:
+            final = row.get("final_item") or {}
+            source = final.get("source")
+            if source == "db":
+                db_count += 1
+            elif source == "mapping":
+                mapping_count += 1
+        unresolved = total - db_count - mapping_count
+        summary = (
+            f"Редове: {total} | намерени в БД: {db_count} | "
+            f"чрез mapping: {mapping_count} | неразрешени: {max(unresolved, 0)}"
+        )
+        self.status_summary_var.set(summary)
 
-        if count:
-            self._offer_export(rows, file_path)
+    def _candidate_label(self, candidate: Dict[str, Any]) -> str:
+        code = candidate.get("code") or "—"
+        name = candidate.get("name") or "без име"
+        match_kind = candidate.get("match") or candidate.get("source")
+        suffix = ""
+        if match_kind == "barcode":
+            suffix = " (по баркод)"
+        elif match_kind == "code":
+            suffix = " (по код)"
+        elif match_kind == "name":
+            suffix = " (по име)"
+        elif match_kind == "mapping":
+            suffix = " (fallback mapping)"
+        return f"{code} | {name}{suffix}"
+
+    def _show_candidate_dialog(self, row: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Optional[int | str]:
+        token = row.get("token") or row.get("raw") or "(без токен)"
+        labels = [self._candidate_label(candidate) for candidate in candidates]
+        dialog = CandidateDialog(self.root, token, labels)
+        return dialog.show()
+
+    def _resolve_candidate_dialogs(self, rows: List[Dict[str, Any]]) -> bool:
+        for index, row in enumerate(rows, start=1):
+            payload = row.get("resolved")
+            if not isinstance(payload, dict):
+                continue
+            candidates = payload.get("candidates")
+            if not isinstance(candidates, list) or not candidates:
+                continue
+            choice = self._show_candidate_dialog(row, candidates)
+            if choice == "cancel":
+                self._log("⚠️ Изборът е прекъснат от потребителя.")
+                return False
+            if choice == "skip":
+                row["resolved"] = None
+                row["final_item"] = None
+                self._log(f"ℹ️ Ред {index} е оставен нерешен по избор на потребителя.")
+                continue
+            if isinstance(choice, int) and 0 <= choice < len(candidates):
+                candidate = candidates[choice]
+                apply_choice = getattr(db_integration, "apply_candidate_choice", None)
+                if callable(apply_choice):
+                    apply_choice(row, candidate, candidate.get("source", "db"))
+                else:
+                    row["resolved"] = dict(candidate)
+                    row["resolved"]["source"] = candidate.get("source", "db")
+                    row["final_item"] = {
+                        "material_id": candidate.get("id"),
+                        "code": candidate.get("code"),
+                        "name": candidate.get("name"),
+                        "qty": row.get("qty") or row.get("quantity") or 1,
+                        "price": row.get("price") or row.get("unit_price") or 0,
+                        "vat": row.get("vat") or 0,
+                        "barcode": candidate.get("barcode"),
+                        "sale_price": row.get("sale_price"),
+                        "source": candidate.get("source", "db"),
+                        "match_kind": candidate.get("match"),
+                    }
+                self._log(
+                    f"✅ Избран артикул за ред {index}: {candidate.get('code') or '—'}"
+                )
+            else:
+                self._log(f"ℹ️ Ред {index} остава без избор.")
+        return True
 
     def _preview_rows(self, rows: List[Dict[str, Any]]) -> None:
         preview_count = min(5, len(rows))
         for idx in range(preview_count):
             row = rows[idx] or {}
-            code = row.get("code") or row.get("Номер") or row.get("item_code")
-            name = row.get("name") or row.get("Име") or row.get("description")
-            qty = row.get("qty") or row.get("quantity") or row.get("Количество")
+            final = row.get("final_item") or {}
+            code = final.get("code") or row.get("code") or row.get("Номер") or row.get("item_code")
+            name = final.get("name") or row.get("name") or row.get("Име") or row.get("description")
+            qty = final.get("qty") or row.get("qty") or row.get("quantity") or row.get("Количество")
             self._log(f"  • {code or '—'} | {name or 'без име'} | количество: {qty if qty is not None else '?'}")
         if len(rows) > preview_count:
             self._log(f"  … още {len(rows) - preview_count} реда.")
 
-    def _push_to_open_delivery(self, rows: List[Dict[str, Any]]) -> None:
+    def _push_to_open_delivery(self, items: List[Dict[str, Any]]) -> None:
         start_fn = getattr(db_integration, "start_open_delivery", None)
         push_fn = getattr(db_integration, "push_parsed_rows", None)
         if not (callable(start_fn) and callable(push_fn)):
@@ -612,7 +828,7 @@ class MicroVisionApp:
 
         try:
             start_fn(self.session)
-            push_fn(self.session, rows)
+            push_fn(self.session, items)
             if os.getenv("MV_ENABLE_OPEN_DELIVERY", "").strip() == "1":
                 self._log("✅ Данните са изпратени към отворена доставка.")
             else:
