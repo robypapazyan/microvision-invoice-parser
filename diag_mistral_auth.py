@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -19,6 +20,7 @@ from mistral_db import (  # type: ignore[attr-defined]
 )
 
 CLIENTS_FILE = Path(__file__).with_name("mistral_clients.json")
+SUMMARY_PREFIX = "SUMMARY:"
 
 
 def load_profiles() -> Dict[str, Dict[str, Any]]:
@@ -112,7 +114,77 @@ def print_meta(meta: Dict[str, Any]) -> None:
 def print_trace(trace: List[Dict[str, Any]]) -> None:
     print("TRACE:")
     print(json.dumps(trace, ensure_ascii=False, indent=2))
-        
+
+
+def build_summary(
+    meta: Dict[str, Any],
+    trace: List[Dict[str, Any]],
+    success: bool,
+    operator_id: int | None,
+    operator_login: str,
+    error_message: str,
+    forced_table: bool,
+) -> List[str]:
+    lines: List[str] = []
+    mode = meta.get("mode")
+    if mode == "sp":
+        proc_name = meta.get("name") or "?"
+        sp_kind = meta.get("sp_kind") or "неизвестна"
+        lines.append(f"Механизъм: процедура {proc_name} ({sp_kind}).")
+        fallback = meta.get("fallback_table")
+        if isinstance(fallback, dict):
+            table_name = fallback.get("name") or "USERS"
+            lines.append(f"Резервна таблица: {table_name}.")
+    elif mode == "table":
+        table_name = meta.get("name") or "USERS"
+        lines.append(f"Механизъм: таблица {table_name}.")
+    else:
+        lines.append("Механизъм: неуспешно откриване.")
+
+    if forced_table:
+        lines.append("Опция --force-table е активна – процедурата е пропусната.")
+
+    actions = [entry.get("action") for entry in trace]
+    if "sp_select" in actions:
+        proc_entries = [e for e in trace if e.get("action") == "sp_select"]
+        if proc_entries:
+            proc = proc_entries[-1].get("procedure") or meta.get("name")
+            lines.append(f"Опит: SELECT от процедура {proc}.")
+    if "sp_execute" in actions:
+        proc_entries = [e for e in trace if e.get("action") == "sp_execute"]
+        if proc_entries:
+            proc = proc_entries[-1].get("procedure") or meta.get("name")
+            lines.append(f"Опит: EXECUTE PROCEDURE {proc}.")
+    if "procedure_fallback_table" in actions:
+        lines.append("Процедурата не върна резултат – преминахме към таблица.")
+
+    table_entries = [e for e in trace if e.get("action") == "table_lookup"]
+    if table_entries:
+        entry = table_entries[-1]
+        table_name = entry.get("table") or meta.get("name") or "USERS"
+        mode_label = entry.get("mode") or "?"
+        if mode_label == "username":
+            match_text = "потребител + парола"
+        elif mode_label == "password":
+            match_text = "само парола"
+        else:
+            match_text = mode_label
+        lines.append(f"Опит: Табличен логин ({match_text}) в {table_name}.")
+    if "table_ambiguous" in actions:
+        ambiguous = [e for e in trace if e.get("action") == "table_ambiguous"]
+        if ambiguous:
+            count = ambiguous[-1].get("matches")
+            lines.append(f"Таблицата върна {count} съвпадения за паролата.")
+
+    if success:
+        lines.append(
+            f"Резултат: УСПЕХ – оператор ID {operator_id}, вход '{operator_login}'."
+        )
+    else:
+        reason = error_message or "неуспешен вход"
+        lines.append(f"Резултат: НЕУСПЕХ – {reason}.")
+    return lines
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Диагностика на Mistral login.")
@@ -123,6 +195,11 @@ def main() -> None:
         "--list-profiles",
         action="store_true",
         help="Изброй наличните профили и излез",
+    )
+    parser.add_argument(
+        "--force-table",
+        action="store_true",
+        help="Пропусни процедурата и използвай директно табличен логин",
     )
     args = parser.parse_args()
 
@@ -150,6 +227,10 @@ def main() -> None:
 
     print_meta(meta)
 
+    if args.force_table:
+        os.environ["MV_FORCE_TABLE_LOGIN"] = "1"
+        print("Активиран е принудителен табличен режим (--force-table).")
+
     if args.user or args.password:
         user_display = args.user if args.user else "<празно>"
         print(f"\nТестов вход с потребител='{user_display}'")
@@ -176,6 +257,11 @@ def main() -> None:
         )
     else:
         print(f"LOGIN RESULT: FAILURE ({error_message or 'неуспешен вход'})")
+
+    summary_lines = build_summary(meta, trace, success, operator_id, operator_login, error_message, args.force_table)
+    print("\nSUMMARY:")
+    for line in summary_lines:
+        print(f"{SUMMARY_PREFIX} {line}")
 
     print_trace(trace)
 

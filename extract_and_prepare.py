@@ -4,7 +4,15 @@ import sys
 import json
 import re
 import difflib
-import pandas as pd
+
+try:
+    import pandas as pd
+
+    PANDAS_AVAILABLE = True
+except ImportError:
+    pd = None  # type: ignore[assignment]
+    PANDAS_AVAILABLE = False
+    print("WARN: pandas липсва – продължаваме без таблици от materials.csv.")
 
 def prompt_user(question, valid_answers=None, gui_mode=False):
     if gui_mode:
@@ -427,6 +435,9 @@ def extract_quantity(line):
     return 1.0
 def load_materials_db():
     """Зарежда базата данни с материали от CSV файл."""
+    if not PANDAS_AVAILABLE:
+        print("WARN: Зареждането на materials.csv е пропуснато (pandas липсва).")
+        return None
     try:
         df = pd.read_csv(MATERIALS_FILE, sep=';', encoding='cp1251', dtype=str)
         # Проверка за наличие на задължителните колони
@@ -529,7 +540,7 @@ def main(input_path=None, gui_mode=False):
         return
 
     # 2. Зареждане на данни
-    materials = load_materials_db()
+    materials_df = load_materials_db() if PANDAS_AVAILABLE else None
     mapping = load_mapping()
     export_items = []
     processed_lines_count = 0
@@ -572,7 +583,11 @@ def main(input_path=None, gui_mode=False):
 
     # 4. Обработка на редовете
     needs_saving = False # Флаг дали има промяна в mapping.json
-    material_names_list = materials['Име на материал'].tolist() # За по-бързо търсене
+    if materials_df is not None:
+        material_names_list = materials_df['Име на материал'].tolist() # За по-бързо търсене
+    else:
+        material_names_list = []
+        print("WARN: Няма заредена таблица с материали – автоматичните съвпадения са ограничени.")
 
     for i, line in enumerate(lines):
         print(f"\n[Ред {i+1}/{len(lines)}] Обработвам: '{line}'")
@@ -609,8 +624,13 @@ def main(input_path=None, gui_mode=False):
 
             if match_found:
                 data = mapping[key]
+                if materials_df is None:
+                    print("  ⚠️ materials.csv не е зареден – пропускам mapping за този ред.")
+                    failed_match_count += 1
+                    found = True
+                    break
                 # Намиране на реда в базата данни
-                row = materials[materials['Номер'] == data['code']]
+                row = materials_df[materials_df['Номер'] == data['code']]
                 if not row.empty:
                     row_data = row.iloc[0]
                     # Създаване на item_data, извикване на extract_quantity и т.н.
@@ -628,7 +648,6 @@ def main(input_path=None, gui_mode=False):
                     found = True # Маркираме, че е намерен
                     break # Излизаме от цикъла for key in mapping
                 else:
-                     # Логиката за невалиден код в mapping
                     print(f"  ⚠️ Намерен ключ '{key}' в mapping (по думи), но код '{data['code']}' не е открит в materials.csv! Пропускам.")
                     failed_match_count +=1
                     found = True # Маркираме като обработен (макар и грешно), за да не търси fuzzy
@@ -661,8 +680,17 @@ def main(input_path=None, gui_mode=False):
         closest_matches = difflib.get_close_matches(line, material_names_list, n=1, cutoff=FUZZY_MATCH_CUTOFF)
 
         if closest_matches:
+            if materials_df is None:
+                print("  ⚠️ Няма заредена таблица с материали – пропускам fuzzy съвпадението.")
+                failed_match_count += 1
+                continue
             matched_name = closest_matches[0]
-            matched_row = materials[materials['Име на материал'] == matched_name].iloc[0]
+            matched_row = materials_df[materials_df['Име на материал'] == matched_name]
+            if matched_row.empty:
+                print("  ⚠️ Предложеното съвпадение не е намерено в materials.csv – пропускам.")
+                failed_match_count += 1
+                continue
+            matched_row = matched_row.iloc[0]
 
             print(f"\n❓ Потенциално съвпадение за ред: '{line}'")
             print(f"   -> Предложение от базата: {matched_row['Номер']} – {matched_name} (Последна покупна: {matched_row['Последна покупна цена']})")
@@ -702,7 +730,7 @@ def main(input_path=None, gui_mode=False):
                         failed_match_count +=1
                         break # Премини към следващия ред
 
-                    result = materials[materials['Номер'] == manual_code]
+                    result = materials_df[materials_df['Номер'] == manual_code]
                     if not result.empty:
                         row_data = result.iloc[0]
                         manual_matched_name = row_data['Име на материал']
@@ -744,7 +772,12 @@ def main(input_path=None, gui_mode=False):
                     failed_match_count +=1
                     break # Премини към следващия ред
 
-                result = materials[materials['Номер'] == manual_code]
+                if materials_df is None:
+                    print("  ⚠️ Няма заредена таблица с материали – ръчният код не може да бъде проверен.")
+                    failed_match_count += 1
+                    continue
+
+                result = materials_df[materials_df['Номер'] == manual_code]
                 if not result.empty:
                     row_data = result.iloc[0]
                     manual_matched_name = row_data['Име на материал']
