@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -149,6 +150,10 @@ def print_trace(trace: List[Dict[str, Any]]) -> None:
             )
         elif action == "procedure_callproc":
             print(f"- {prefix}Опит за callproc: {step.get('procedure')}")
+        elif action == "procedure_fallback_table":
+            print(
+                f"- {prefix}Fallback към таблица: {step.get('procedure')} -> {step.get('table')}"
+            )
         elif action == "table_attempt":
             params = step.get("params", {})
             print(
@@ -212,6 +217,7 @@ def main() -> None:
         print("\nТестов вход без потребителско име (само парола)")
 
     result_text = ""
+    success = False
     try:
         operator_id, operator_login = login_user(args.user or "", args.password or "")
     except MistralDBError as exc:
@@ -221,6 +227,7 @@ def main() -> None:
             "Краен резултат: УСПЕХ – "
             f"оператор ID={operator_id}, потребител={operator_login}"
         )
+        success = True
     finally:
         trace = get_last_login_trace()
         print_trace(trace)
@@ -234,6 +241,7 @@ def main() -> None:
             pass
 
     print("\n" + result_text)
+    sys.exit(0 if success else 1)
 
 
 if __name__ == "__main__":
