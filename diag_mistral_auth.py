@@ -13,8 +13,11 @@ from typing import Any, Dict, List
 from mistral_db import (  # type: ignore[attr-defined]
     MistralDBError,
     connect,
+    detect_catalog_schema,
     detect_login_method,
+    find_material_candidates,
     get_last_login_trace,
+    get_material_by_barcode,
     logger,
     login_user,
 )
@@ -278,6 +281,86 @@ def main() -> None:
 
     print_meta(meta)
 
+    diag_ok = True
+    try:
+        schema = detect_catalog_schema(cur)
+    except MistralDBError as exc:
+        print(f"\nКаталожна схема: НЕУСПЕШНО – {exc}")
+        diag_ok = False
+        schema = {}
+    else:
+        print("\nКаталожна схема: УСПЕШНО")
+        materials_table = schema.get("materials_table")
+        materials_name = schema.get("materials_name")
+        barcode_table = schema.get("barcode_table")
+        barcode_col = schema.get("barcode_col")
+        print(f"  - Материали: {materials_table or 'не е открита'}")
+        print(f"  - Име на материал: {materials_name or 'не е открита'}")
+        if barcode_table:
+            print(f"  - Баркодове: {barcode_table} (колона {barcode_col or '—'})")
+        else:
+            print("  - Баркодове: не е открита таблица")
+        if materials_table:
+            try:
+                cur.execute(f"SELECT COUNT(*) FROM {materials_table}")
+                count = cur.fetchone()[0]
+                print(f"  - Брой материали: {count}")
+            except Exception as exc:
+                print(f"  - Брой материали: грешка ({exc})")
+                diag_ok = False
+        if barcode_table:
+            try:
+                cur.execute(f"SELECT COUNT(*) FROM {barcode_table}")
+                barcode_count = cur.fetchone()[0]
+                print(f"  - Брой баркодове: {barcode_count}")
+            except Exception as exc:
+                print(f"  - Брой баркодове: грешка ({exc})")
+                diag_ok = False
+
+        if barcode_table and barcode_col:
+            try:
+                cur.execute(
+                    f"SELECT FIRST 1 TRIM({barcode_col}) FROM {barcode_table} "
+                    f"WHERE TRIM({barcode_col}) <> ''"
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    sample_barcode = str(row[0]).strip()
+                    material = get_material_by_barcode(cur, sample_barcode)
+                    if material:
+                        print(f"Пример баркод: {sample_barcode} → {material.code} | {material.name}")
+                    else:
+                        print(f"Пример баркод: {sample_barcode} (няма намерен материал)")
+                else:
+                    print("Пример баркод: няма налични стойности")
+            except Exception as exc:
+                print(f"Пример баркод: НЕУСПЕШНО – {exc}")
+                diag_ok = False
+        else:
+            print("Пример баркод: пропуснато – няма таблица за баркодове")
+
+        if materials_table and materials_name:
+            try:
+                cur.execute(
+                    f"SELECT FIRST 1 TRIM({materials_name}) FROM {materials_table} "
+                    f"WHERE TRIM({materials_name}) <> ''"
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    sample_name = str(row[0]).strip()
+                    candidates = find_material_candidates(cur, sample_name, limit=3)
+                    if candidates:
+                        first = candidates[0]
+                        print(f"Пример име '{sample_name}' → {first.code} | {first.name}")
+                    else:
+                        print(f"Пример име '{sample_name}': няма кандидати в каталога")
+                else:
+                    print("Пример име: няма налични стойности")
+            except Exception as exc:
+                print(f"Пример име: НЕУСПЕШНО – {exc}")
+                diag_ok = False
+        else:
+            print("Пример име: пропуснато – няма колонa за име на материал")
     if args.force_table:
         os.environ["MV_FORCE_TABLE_LOGIN"] = "1"
         print("Активиран е принудителен табличен режим (--force-table).")
@@ -315,6 +398,9 @@ def main() -> None:
         print(f"{SUMMARY_PREFIX} {line}")
 
     print_trace(trace)
+
+    overall_ok = diag_ok and success
+    print(f"\nDIAG STATUS: {'OK' if overall_ok else 'FAIL'}")
 
     try:
         cur.close()

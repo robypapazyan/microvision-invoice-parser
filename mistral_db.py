@@ -1,21 +1,20 @@
 """Utility helpers for talking to a Mistral (Firebird) database."""
 from __future__ import annotations
 
+import ctypes
 import hashlib
-import logging
 import os
+import sys
 from contextlib import contextmanager
-from datetime import datetime, date
+from dataclasses import dataclass
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-# logging handlers are imported lazily in the configuration helper
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple, runtime_checkable
+
 import re
 
-try:  # pragma: no cover - loguru е предпочитан, но не задължителен
-    from loguru import logger as _loguru_logger
-except ImportError:  # pragma: no cover - fallback към logging
-    _loguru_logger = None  # type: ignore
+from loguru import logger
 
 
 _LOG_CONFIGURED = False
@@ -31,30 +30,6 @@ _CATALOG_SCHEMA: Dict[str, str | None] | None = None
 _DELIVERY_CONTEXT: Dict[int, Dict[str, Any]] = {}
 _FIELD_LENGTH_CACHE: Dict[tuple[str, str], int] = {}
 _last_login_trace: List[Dict[str, Any]] = []
-
-
-logger: Any
-if _loguru_logger is not None:
-    logger = _loguru_logger
-else:  # pragma: no cover - при липса на loguru
-    logger = logging.getLogger("microvision")
-
-
-def _cleanup_old_logs(log_dir: Path, keep: int = 14) -> None:
-    try:
-        log_files = sorted(log_dir.glob("app_*.log"))
-    except Exception:  # pragma: no cover - защитно
-        return
-    if keep <= 0:
-        return
-    excess = len(log_files) - keep
-    if excess <= 0:
-        return
-    for old_file in log_files[:excess]:
-        try:
-            old_file.unlink()
-        except Exception:
-            continue
 
 
 def _configure_logging() -> None:
@@ -74,48 +49,34 @@ def _configure_logging() -> None:
         or "INFO"
     ).upper() or "INFO"
 
-    if _loguru_logger is not None:
-        log_file = log_dir / "app_{time:YYYYMMDD}.log"
-        try:
-            logger.add(
-                log_file,
-                rotation="00:00",
-                retention="14 days",
-                level=log_level_name,
-                encoding="utf-8",
-            )
-        except Exception:  # pragma: no cover - ако loguru е вече конфигуриран
-            pass
-    else:  # pragma: no cover - logging fallback
-        level = getattr(logging, log_level_name, logging.INFO)
-        logger.setLevel(level)
-        log_file = log_dir / f"app_{datetime.now():%Y%m%d}.log"
-        handler = logging.FileHandler(log_file, encoding="utf-8")
-        handler.setLevel(level)
-        formatter = logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-        handler.setFormatter(formatter)
-        if not any(getattr(h, "_microvision_daily", False) for h in logger.handlers):
-            setattr(handler, "_microvision_daily", True)
-            logger.addHandler(handler)
-        logger.propagate = False
-        _cleanup_old_logs(log_dir)
+    try:
+        logger.remove()
+    except Exception:  # pragma: no cover - защитно
+        pass
+
+    logger.add(
+        sys.stderr,
+        level=log_level_name,
+        enqueue=False,
+    )
+    logger.add(
+        log_dir / "app_{time:YYYYMMDD_HHmmss}.log",
+        level=log_level_name,
+        rotation="1 MB",
+        retention=10,
+        encoding="utf-8",
+        enqueue=False,
+        backtrace=False,
+        diagnose=False,
+    )
 
     _LOG_CONFIGURED = True
 
 
 def _log_with_level(level: str, message: str, **kwargs: Any) -> None:
     _configure_logging()
-    if _loguru_logger is not None:
-        bound = logger.bind(**kwargs) if kwargs else logger
-        getattr(bound, level)(message)
-        return
-    if kwargs:
-        extras = ", ".join(f"{key}={value}" for key, value in kwargs.items())
-        message = f"{message} | {extras}"
-    getattr(logger, level)(message)
+    bound = logger.bind(**kwargs) if kwargs else logger
+    getattr(bound, level)(message)
 
 
 def _log_info(message: str, **kwargs: Any) -> None:
@@ -137,22 +98,210 @@ def _log_error(message: str, **kwargs: Any) -> None:
 _configure_logging()
 
 
-try:  # предпочитаме fdb (поддържа Firebird 2.5)
+try:  # pragma: no cover - import guard
+    from firebird.driver import Error as _FirebirdDriverError  # type: ignore
+    from firebird.driver import connect as _firebird_connect  # type: ignore
+except ImportError:  # pragma: no cover - може да липсва
+    _FirebirdDriverError = None  # type: ignore
+    _firebird_connect = None  # type: ignore
+
+try:  # pragma: no cover - import guard
     import fdb  # type: ignore
-
-    _FB_API = "fdb"
-    _FB_ERROR = fdb.DatabaseError
-except ImportError:  # pragma: no cover - fallback към firebird-driver
+except ImportError:  # pragma: no cover - може да липсва
     fdb = None  # type: ignore
-    try:
-        from firebird.driver import connect as fb_connect  # type: ignore
-        from firebird.driver import Error as _FB_ERROR  # type: ignore
 
-        _FB_API = "firebird-driver"
-    except ImportError as exc:  # pragma: no cover
-        raise ImportError(
-            "Не е открит Firebird драйвер. Инсталирайте 'fdb' или 'firebird-driver'."
-        ) from exc
+
+@runtime_checkable
+class FbClient(Protocol):
+    """Общ интерфейс за Firebird клиенти."""
+
+    def connect(
+        self,
+        host: str,
+        port: int,
+        database: str,
+        user: str,
+        password: str,
+        charset: str,
+    ) -> "FbClient":
+        ...
+
+    def cursor(self) -> Any:
+        ...
+
+    def close(self) -> None:
+        ...
+
+
+class _BaseFbClient:
+    """Базов адаптер, който унифицира поведението между драйверите."""
+
+    def __init__(self) -> None:
+        self._conn: Any | None = None
+
+    def connect(
+        self,
+        host: str,
+        port: int,
+        database: str,
+        user: str,
+        password: str,
+        charset: str,
+    ) -> "_BaseFbClient":
+        raise NotImplementedError
+
+    def cursor(self) -> Any:
+        if self._conn is None:
+            raise MistralDBError("Няма активна връзка за курсор.")
+        return self._conn.cursor()
+
+    def close(self) -> None:
+        if self._conn is None:
+            return
+        try:
+            self._conn.close()
+        except Exception:  # pragma: no cover - защитно
+            pass
+        self._conn = None
+
+    def begin(self) -> Any:
+        if self._conn is None:
+            raise MistralDBError("Няма активна връзка.")
+        begin_fn = getattr(self._conn, "begin", None)
+        if callable(begin_fn):
+            return begin_fn()
+        return None
+
+    def commit(self) -> Any:
+        if self._conn is None:
+            return None
+        commit_fn = getattr(self._conn, "commit", None)
+        if callable(commit_fn):
+            return commit_fn()
+        return None
+
+    def rollback(self) -> Any:
+        if self._conn is None:
+            return None
+        rollback_fn = getattr(self._conn, "rollback", None)
+        if callable(rollback_fn):
+            return rollback_fn()
+        return None
+
+    def __getattr__(self, item: str) -> Any:
+        if self._conn is None:
+            raise AttributeError(item)
+        return getattr(self._conn, item)
+
+
+class FirebirdDriverClient(_BaseFbClient):
+    """Адаптер за официалния firebird-driver."""
+
+    def connect(
+        self,
+        host: str,
+        port: int,
+        database: str,
+        user: str,
+        password: str,
+        charset: str,
+    ) -> "FirebirdDriverClient":
+        if _firebird_connect is None:
+            raise ImportError("firebird-driver не е наличен")
+        database_path = _normalize_database_path(database)
+        self._conn = _firebird_connect(  # type: ignore[misc]
+            host=host,
+            port=port,
+            database=database_path,
+            user=user,
+            password=password,
+            charset=charset,
+        )
+        return self
+
+
+class FdbClient(_BaseFbClient):
+    """Адаптер за класическия fdb драйвер."""
+
+    def connect(
+        self,
+        host: str,
+        port: int,
+        database: str,
+        user: str,
+        password: str,
+        charset: str,
+    ) -> "FdbClient":
+        if fdb is None:
+            raise ImportError("fdb не е наличен")
+        database_path = _normalize_database_path(database)
+        self._conn = fdb.connect(  # type: ignore[arg-type]
+            host=host,
+            port=port,
+            database=database_path,
+            user=user,
+            password=password,
+            charset=charset,
+        )
+        return self
+
+
+_FB_CLIENT_CLASS: type[_BaseFbClient]
+
+if _firebird_connect is not None:
+    _FB_API = "firebird-driver"
+    _FB_ERROR = _FirebirdDriverError or Exception  # type: ignore[assignment]
+    _FB_CLIENT_CLASS = FirebirdDriverClient
+elif fdb is not None:
+    _FB_API = "fdb"
+    _FB_ERROR = fdb.DatabaseError  # type: ignore[attr-defined]
+    _FB_CLIENT_CLASS = FdbClient
+else:  # pragma: no cover - защитно
+    raise ImportError(
+        "Не е открит Firebird драйвер. Инсталирайте 'firebird-driver' или 'fdb'."
+    )
+
+
+def get_short_path(path: str) -> str:
+    """Връща short-path версия на път (Windows-only)."""
+
+    if os.name != "nt":
+        return path
+    if path in (None, ""):
+        return path
+    fs_path = os.fspath(path)
+    if not isinstance(fs_path, str):
+        fs_path = str(fs_path)
+    try:
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover - защитно
+        return fs_path
+    try:
+        needed = kernel32.GetShortPathNameW(fs_path, None, 0)
+        if needed == 0:
+            return fs_path
+        buffer = ctypes.create_unicode_buffer(needed)
+        result = kernel32.GetShortPathNameW(fs_path, buffer, needed)
+        if result == 0:
+            return fs_path
+        return buffer.value or fs_path
+    except Exception:  # pragma: no cover - защитно
+        return fs_path
+
+
+def _normalize_database_path(database: str) -> str:
+    """Ако пътят съдържа не-ASCII символи → връщаме short-path версията."""
+
+    fs_path = os.fspath(database)
+    if not isinstance(fs_path, str):
+        fs_path = str(fs_path)
+    if os.name != "nt":
+        return fs_path
+    if any(ord(ch) > 127 for ch in fs_path):
+        short = get_short_path(fs_path)
+        if short:
+            return short
+    return fs_path
 
 
 class MistralDBError(RuntimeError):
@@ -161,6 +310,40 @@ class MistralDBError(RuntimeError):
 
 class UnsupportedAuthSchema(MistralDBError):
     """Непозната auth схема."""
+
+
+@dataclass
+class Material:
+    """Опростено представяне на артикул от каталога."""
+
+    code: str
+    name: str
+    storage_code: Optional[str] = None
+    barcode: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "code": self.code,
+            "name": self.name,
+            "storage_code": self.storage_code,
+            "barcode": self.barcode,
+        }
+
+
+def _clean_str(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    try:
+        return str(value).strip()
+    except Exception:  # pragma: no cover - защитно
+        return ""
+
+
+def _optional_str(value: Any) -> Optional[str]:
+    cleaned = _clean_str(value)
+    return cleaned or None
 
 
 def _profile_label() -> str:
@@ -321,24 +504,26 @@ def _transaction() -> Iterable[Any]:
         raise
 
 
-def _connect_raw(host: str, port: int, database: str, user: str, password: str, charset: str):
-    if _FB_API == "fdb":  # pragma: no branch - основен сценарий при 2.5
-        return fdb.connect(  # type: ignore[arg-type]
-            host=host,
-            port=port,
-            database=database,
-            user=user,
-            password=password,
-            charset=charset,
-        )
-    return fb_connect(  # type: ignore[misc]
-        host=host,
-        port=port,
-        database=database,
-        user=user,
-        password=password,
-        charset=charset,
-    )
+def _connect_raw(host: str, port: int, database: str, user: str, password: str, charset: str) -> FbClient:
+    client = _FB_CLIENT_CLASS()
+    try:
+        conn = client.connect(host, port, database, user, password, charset)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT 1 FROM RDB$DATABASE")
+            cursor.fetchone()
+        finally:
+            try:
+                cursor.close()
+            except Exception:  # pragma: no cover - защитно
+                pass
+        return conn
+    except Exception:
+        try:
+            client.close()
+        except Exception:  # pragma: no cover - защитно
+            pass
+        raise
 
 
 def _field_type_name(
@@ -794,6 +979,87 @@ def _catalog_select_clause(schema: Dict[str, str | None], include_barcode: bool 
     _expr(schema.get("materials_price"), "ITEM_PRICE")
     _expr(schema.get("materials_vat"), "ITEM_VAT")
     return ", ".join(parts), aliases
+
+
+def get_material_by_barcode(cur: Any, barcode: str) -> Optional[Material]:
+    """Търси материал по баркод и връща опростен запис."""
+
+    value = (barcode or "").strip()
+    if not value:
+        return None
+
+    active_cur = _require_cursor(cur=cur)
+    schema = detect_catalog_schema(active_cur)
+    barcode_table = schema.get("barcode_table")
+    barcode_col = schema.get("barcode_col")
+    barcode_fk = schema.get("barcode_mat_fk")
+    materials_table = schema.get("materials_table")
+    materials_code = schema.get("materials_code")
+    materials_name = schema.get("materials_name")
+    if not (
+        barcode_table
+        and barcode_col
+        and barcode_fk
+        and materials_table
+        and materials_code
+        and materials_name
+    ):
+        return None
+
+    sql = (
+        f"SELECT FIRST 1 TRIM(M.{materials_code}), TRIM(M.{materials_name}), "
+        f"TRIM(B.{barcode_fk}) "
+        f"FROM {barcode_table} B "
+        f"JOIN {materials_table} M ON B.{barcode_fk} = M.{materials_code} "
+        f"WHERE TRIM(B.{barcode_col}) = TRIM(?)"
+    )
+    active_cur.execute(sql, (value,))
+    row = active_cur.fetchone()
+    if not row:
+        return None
+    code = _clean_str(row[0])
+    name = _clean_str(row[1])
+    storage_code = _optional_str(row[2]) if len(row) > 2 else None
+    return Material(code=code, name=name, storage_code=storage_code, barcode=value)
+
+
+def find_material_candidates(
+    cur: Any, name_like: str, limit: int = 5
+) -> List[Material]:
+    """Търси материали по част от името с UPPER LIKE."""
+
+    normalized = " ".join((name_like or "").split())
+    if not normalized:
+        return []
+
+    active_cur = _require_cursor(cur=cur)
+    schema = detect_catalog_schema(active_cur)
+    materials_table = schema.get("materials_table")
+    materials_name = schema.get("materials_name")
+    materials_code = schema.get("materials_code")
+    if not (materials_table and materials_name and materials_code):
+        return []
+
+    try:
+        safe_limit = max(1, int(limit))
+    except (TypeError, ValueError):  # pragma: no cover - защитно
+        safe_limit = 5
+
+    pattern = f"%{normalized.upper()}%"
+    sql = (
+        f"SELECT FIRST {safe_limit} TRIM(M.{materials_code}), TRIM(M.{materials_name}) "
+        f"FROM {materials_table} M "
+        f"WHERE UPPER(TRIM(M.{materials_name})) LIKE ? "
+        f"ORDER BY CHAR_LENGTH(TRIM(M.{materials_name}))"
+    )
+    active_cur.execute(sql, (pattern,))
+    rows = active_cur.fetchall() or []
+    materials: List[Material] = []
+    for row in rows:
+        code = _clean_str(row[0])
+        name = _clean_str(row[1])
+        materials.append(Material(code=code, name=name))
+    return materials
 
 
 def get_item_by_barcode(cur: Any, barcode: str) -> Optional[Dict[str, Any]]:

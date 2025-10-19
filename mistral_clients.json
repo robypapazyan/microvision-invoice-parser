@@ -4,7 +4,7 @@
     "driver": "firebird-driver",
     "host": "localhost",
     "port": 3050,
-    "database": "D:\\base\\TESTBARBERSHOP.FDB",
+    "database": "D:/base/TESTBARBERSHOP.FDB",
     "user": "SYSDBA",
     "password": "masterkey",
     "charset": "WIN1251",
@@ -13,14 +13,62 @@
     "location_id": 1,
     "storage_id": 1,
     "operation_doc_type": 2,
-
     "auth": {
       "use_procedures": false,
-      "table_candidates": ["USERS","OPERATORS","POTREBITELI","OPERATORI","USERI","PERSONS"],
-      "login_cols": ["CODE","KOD","LOGIN","USERNAME","USER_NAME","NAME","OPERATOR"],
-      "password_cols": ["PASS","PASSWORD","PAROLA","PASS_HASH","PAROLA_HASH","PWD"],
-      "salt_cols": ["SALT"],
-      "hash_order": ["MD5","SHA1","SHA256","PLAIN"]
+      "table_candidates": [
+        "USERS",
+        "OPERATORS",
+        "POTREBITELI",
+        "OPERATORI",
+        "USERI",
+        "PERSONS"
+      ],
+      "login_cols": [
+        "CODE",
+        "KOD",
+        "LOGIN",
+        "USERNAME",
+        "USER_NAME",
+        "NAME",
+        "OPERATOR"
+      ],
+      "password_cols": [
+        "PASS",
+        "PASSWORD",
+        "PAROLA",
+        "PASS_HASH",
+        "PAROLA_HASH",
+        "PWD"
+      ],
+      "salt_cols": [
+        "SALT"
+      ],
+      "hash_order": [
+        "MD5",
+        "SHA1",
+        "SHA256",
+        "PLAIN"
+      ]
     }
+  },
+  {
+    "name": "Книжарница",
+    "host": "192.168.0.10",
+    "port": 3050,
+    "database": "C:/данни/Мистрал/BOOKSHOP.FDB",
+    "user": "SYSDBA",
+    "password": "masterkey",
+    "charset": "WIN1251",
+    "comment": "Примерен профил с кирилица в пътя"
+  },
+  {
+    "name": "Micro Vision (реална)",
+    "host": "sql.microvision.bg",
+    "port": 3050,
+    "database": "D:/Микро Вижън/Prod/MICROVISION.FDB",
+    "user": "OPERATOR",
+    "password": "secret",
+    "charset": "WIN1251",
+    "comment": "Реална база – попълнете коректни креденшъли"
   }
 ]
