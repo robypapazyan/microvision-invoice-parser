@@ -29,6 +29,7 @@ _DELIVERY_GENERATORS: Dict[str, Optional[str]] | None = None
 _TABLE_COLUMNS: Dict[str, Dict[str, Dict[str, Any]]] = {}
 _CATALOG_SCHEMA: Dict[str, str | None] | None = None
 _DELIVERY_CONTEXT: Dict[int, Dict[str, Any]] = {}
+_FIELD_LENGTH_CACHE: Dict[tuple[str, str], int] = {}
 _last_login_trace: List[Dict[str, Any]] = []
 
 
@@ -732,6 +733,41 @@ def _row_to_catalog_item(row: Sequence[Any], columns: Sequence[str]) -> Dict[str
     return result
 
 
+def get_field_max_len(cur: Any, table: str, field: str) -> int:
+    """Връща максималната дължина за дадено поле, използвайки кеш."""
+
+    normalized_table = (table or "").strip()
+    normalized_field = (field or "").strip()
+    if not normalized_table or not normalized_field:
+        return 255
+
+    cache_key = (normalized_table.upper(), normalized_field.upper())
+    cached = _FIELD_LENGTH_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    active_cur = _require_cursor(cur=cur)
+    sql = (
+        "SELECT COALESCE(f.rdb$character_length, f.rdb$field_length) "
+        "FROM rdb$relation_fields rf "
+        "JOIN rdb$fields f ON f.rdb$field_name = rf.rdb$field_source "
+        "WHERE UPPER(rf.rdb$relation_name) = ? "
+        "AND UPPER(rf.rdb$field_name) = ?"
+    )
+    try:
+        active_cur.execute(sql, cache_key)
+        row = active_cur.fetchone()
+        if row and row[0]:
+            length = int(row[0])
+        else:
+            length = 255
+    except Exception:
+        length = 255
+
+    _FIELD_LENGTH_CACHE[cache_key] = length
+    return length
+
+
 def _catalog_select_clause(schema: Dict[str, str | None], include_barcode: bool = True) -> Tuple[str, List[str]]:
     parts: List[str] = []
     aliases: List[str] = []
@@ -773,15 +809,15 @@ def get_item_by_barcode(cur: Any, barcode: str) -> Optional[Dict[str, Any]]:
     barcode_col = schema.get("barcode_col")
     barcode_fk = schema.get("barcode_mat_fk")
     materials_table = schema.get("materials_table")
-    materials_id = schema.get("materials_id")
-    if not (barcode_table and barcode_col and barcode_fk and materials_table and materials_id):
+    materials_code = schema.get("materials_code")
+    if not (barcode_table and barcode_col and barcode_fk and materials_table and materials_code):
         return None
 
     select_clause, aliases = _catalog_select_clause(schema, include_barcode=True)
     sql = (
         f"SELECT FIRST 1 {select_clause} "
         f"FROM {barcode_table} B "
-        f"JOIN {materials_table} M ON B.{barcode_fk} = M.{materials_id} "
+        f"JOIN {materials_table} M ON B.{barcode_fk} = M.{materials_code} "
         f"WHERE TRIM(B.{barcode_col}) = TRIM(?)"
     )
     active_cur.execute(sql, (value,))
@@ -809,9 +845,14 @@ def get_item_by_code(cur: Any, code: str) -> Optional[Dict[str, Any]]:
 
     select_clause, aliases = _catalog_select_clause(schema, include_barcode=bool(schema.get("barcode_table")))
     join_clause = ""
-    if schema.get("barcode_table") and schema.get("barcode_col") and schema.get("barcode_mat_fk") and materials_id:
+    if (
+        schema.get("barcode_table")
+        and schema.get("barcode_col")
+        and schema.get("barcode_mat_fk")
+        and materials_code
+    ):
         join_clause = (
-            f" LEFT JOIN {schema['barcode_table']} B ON B.{schema['barcode_mat_fk']} = M.{materials_id}"
+            f" LEFT JOIN {schema['barcode_table']} B ON B.{schema['barcode_mat_fk']} = M.{materials_code}"
         )
 
     sql = (
@@ -828,10 +869,10 @@ def get_item_by_code(cur: Any, code: str) -> Optional[Dict[str, Any]]:
     return _row_to_catalog_item(row, description or aliases)
 
 
-def find_item_candidates_by_name(cur: Any, name: str, limit: int = 3) -> List[Dict[str, Any]]:
-    """Намира кандидати по подобие на име."""
+def get_items_by_name(cur: Any, name_query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """Търси артикули по име чрез CONTAINING."""
 
-    normalized = " ".join((name or "").split())
+    normalized = " ".join((name_query or "").split())
     if not normalized:
         return []
 
@@ -839,36 +880,56 @@ def find_item_candidates_by_name(cur: Any, name: str, limit: int = 3) -> List[Di
     schema = detect_catalog_schema(active_cur)
     materials_table = schema.get("materials_table")
     name_col = schema.get("materials_name")
-    materials_id = schema.get("materials_id")
-    if not (materials_table and name_col):
+    materials_code = schema.get("materials_code")
+    if not (materials_table and name_col and materials_code):
         return []
 
     try:
         safe_limit = max(1, int(limit))
     except (TypeError, ValueError):
-        safe_limit = 3
+        safe_limit = 5
 
-    select_clause, aliases = _catalog_select_clause(schema, include_barcode=bool(schema.get("barcode_table")))
-    join_clause = ""
-    if schema.get("barcode_table") and schema.get("barcode_col") and schema.get("barcode_mat_fk") and materials_id:
-        join_clause = (
-            f" LEFT JOIN {schema['barcode_table']} B ON B.{schema['barcode_mat_fk']} = M.{materials_id}"
+    max_len = max(1, int(get_field_max_len(active_cur, materials_table, name_col)))
+    search_value = normalized[:max_len]
+
+    select_clause, aliases = _catalog_select_clause(schema, include_barcode=False)
+    barcode_expr = "NULL AS ITEM_BARCODE"
+    if (
+        schema.get("barcode_table")
+        and schema.get("barcode_col")
+        and schema.get("barcode_mat_fk")
+    ):
+        barcode_expr = (
+            f"(SELECT FIRST 1 TRIM(B.{schema['barcode_col']}) "
+            f"FROM {schema['barcode_table']} B "
+            f"WHERE B.{schema['barcode_mat_fk']} = M.{materials_code}) AS ITEM_BARCODE"
         )
 
-    pattern = f"%{_escape_like(normalized)}%"
+    final_select = barcode_expr
+    final_aliases = ["ITEM_BARCODE"]
+    if select_clause:
+        final_select = f"{select_clause}, {barcode_expr}"
+        final_aliases = list(aliases) + ["ITEM_BARCODE"]
+
     sql = (
-        f"SELECT DISTINCT FIRST {safe_limit} {select_clause} "
-        f"FROM {materials_table} M"
-        f"{join_clause} "
-        f"WHERE UPPER(TRIM(M.{name_col})) LIKE UPPER(?) ESCAPE '\\' "
+        f"SELECT FIRST {safe_limit} {final_select} "
+        f"FROM {materials_table} M "
+        f"WHERE M.{name_col} CONTAINING ? "
         f"ORDER BY CHAR_LENGTH(TRIM(M.{name_col}))"
     )
-    active_cur.execute(sql, (pattern,))
+    active_cur.execute(sql, (search_value,))
     rows = active_cur.fetchall() or []
     if not rows:
         return []
     description = [desc[0].strip().upper() for desc in active_cur.description]
-    return [_row_to_catalog_item(row, description or aliases) for row in rows]
+    columns = description or final_aliases
+    return [_row_to_catalog_item(row, columns) for row in rows]
+
+
+def find_item_candidates_by_name(cur: Any, name: str, limit: int = 3) -> List[Dict[str, Any]]:
+    """Обратна съвместимост – използва get_items_by_name."""
+
+    return get_items_by_name(cur, name, limit=limit)
 
 
 def _enrich_catalog_result(data: Dict[str, Any], match: str) -> Dict[str, Any]:
@@ -876,6 +937,48 @@ def _enrich_catalog_result(data: Dict[str, Any], match: str) -> Dict[str, Any]:
     payload["source"] = "db"
     payload["match"] = match
     return payload
+
+
+def resolve_item(cur: Any, token: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Резолвира артикул с приоритет: баркод → код → име."""
+
+    normalized = " ".join((token or "").split())
+    if not normalized:
+        return []
+
+    active_cur = _require_cursor(cur=cur)
+
+    item = get_item_by_barcode(active_cur, normalized)
+    if item:
+        enriched = dict(item)
+        enriched["match"] = "barcode"
+        enriched.setdefault("source", "db")
+        return [enriched]
+
+    item = get_item_by_code(active_cur, normalized)
+    if item:
+        enriched = dict(item)
+        enriched["match"] = "code"
+        enriched.setdefault("source", "db")
+        return [enriched]
+
+    if limit is None:
+        try:
+            env_limit = int(os.getenv("MV_DB_NAME_LIKE_LIMIT", "5") or "5")
+        except ValueError:
+            env_limit = 5
+        limit_value = env_limit
+    else:
+        limit_value = limit
+
+    candidates = get_items_by_name(active_cur, normalized, limit=max(1, int(limit_value)))
+    results: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        enriched = dict(candidate)
+        enriched["match"] = "name"
+        enriched.setdefault("source", "db")
+        results.append(enriched)
+    return results
 
 
 def _hash_with_algo(plain: str, salt: Optional[str], algo: str) -> str:
@@ -1606,15 +1709,7 @@ def get_item_info(code_or_name: str) -> Optional[Dict[str, Any]]:
     if not value:
         return None
 
-    item = get_item_by_code(cur, value)
-    if item:
-        return item
-
-    item = get_item_by_barcode(cur, value)
-    if item:
-        return item
-
-    candidates = find_item_candidates_by_name(cur, value, limit=1)
+    candidates = resolve_item(cur, value, limit=1)
     if candidates:
         return candidates[0]
     return None
@@ -1627,12 +1722,12 @@ def db_find_by_barcode(cur: Any, barcode: str) -> List[Dict[str, Any]]:
     if not normalized:
         return []
 
-    item = get_item_by_barcode(cur, normalized)
-    if not item:
+    candidates = resolve_item(cur, normalized, limit=1)
+    matches = [candidate for candidate in candidates if candidate.get("match") == "barcode"]
+    if not matches:
         return []
-    result = [_enrich_catalog_result(item, "barcode")]
-    logger.info("DB resolve: barcode match → %s кандидата за %s", len(result), normalized)
-    return result
+    logger.info("DB resolve: barcode match → %s кандидата за %s", len(matches), normalized)
+    return matches
 
 
 def db_find_by_code(cur: Any, code: str) -> List[Dict[str, Any]]:
@@ -1642,12 +1737,12 @@ def db_find_by_code(cur: Any, code: str) -> List[Dict[str, Any]]:
     if not normalized:
         return []
 
-    item = get_item_by_code(cur, normalized)
-    if not item:
+    candidates = resolve_item(cur, normalized, limit=1)
+    matches = [candidate for candidate in candidates if candidate.get("match") == "code"]
+    if not matches:
         return []
-    result = [_enrich_catalog_result(item, "code")]
-    logger.info("DB resolve: code match → %s кандидата за %s", len(result), normalized)
-    return result
+    logger.info("DB resolve: code match → %s кандидата за %s", len(matches), normalized)
+    return matches
 
 
 def _escape_like(value: str) -> str:
@@ -1661,8 +1756,11 @@ def db_find_by_name_like(cur: Any, name: str, limit: int = 5) -> List[Dict[str, 
     if not normalized:
         return []
 
-    candidates = find_item_candidates_by_name(cur, normalized, limit=limit)
-    results = [_enrich_catalog_result(candidate, "name") for candidate in candidates]
+    candidates = get_items_by_name(cur, normalized, limit=limit)
+    results = [
+        dict(candidate, match="name", source=candidate.get("source", "db"))
+        for candidate in candidates
+    ]
     logger.info(
         "DB resolve: name LIKE → %s кандидата за %s",
         len(results),
@@ -1680,21 +1778,14 @@ def db_resolve_item(cur: Any, token: str) -> List[Dict[str, Any]]:
         return []
 
     active_cur = _require_cursor(cur=cur)
-    barcode_candidates = db_find_by_barcode(active_cur, normalized)
-    if barcode_candidates:
-        return barcode_candidates
-
-    code_candidates = db_find_by_code(active_cur, normalized)
-    if code_candidates:
-        return code_candidates
-
-    try:
-        limit_env = int(os.getenv("MV_DB_NAME_LIKE_LIMIT", "5") or "5")
-    except ValueError:
-        limit_env = 5
-    name_candidates = db_find_by_name_like(active_cur, normalized, limit=limit_env)
-    if name_candidates:
-        return name_candidates
+    candidates = resolve_item(active_cur, normalized)
+    if candidates:
+        logger.info(
+            "DB resolve: намерени са %s кандидата за %s",
+            len(candidates),
+            normalized,
+        )
+        return candidates
 
     logger.info("DB resolve: no match за '%s'", normalized)
     return []

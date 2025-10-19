@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -92,6 +92,7 @@ class SessionState:
     last_login_trace: Optional[List[Dict[str, Any]]] = None
     password: str = ""
     ui_root: Any = None
+    output_logger: Optional[Callable[[str], None]] = None
 
 
 
@@ -223,6 +224,7 @@ class MicroVisionApp:
 
         self.session = SessionState()
         self.session.ui_root = self.root
+        self.session.output_logger = self._log
         _check_runtime_dependencies()
         self.profiles = load_profiles()
         self.profile_names: List[str] = list(self.profiles.keys())
