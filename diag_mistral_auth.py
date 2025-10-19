@@ -70,6 +70,37 @@ def _format_field(field: Dict[str, Any]) -> str:
     return f"{name} – {type_name}"
 
 
+def _procedure_examples(meta: Dict[str, Any]) -> Dict[str, str]:
+    name = meta.get("name") or "?"
+    inputs = meta.get("fields", {}).get("inputs") or []
+    placeholders = ", ".join(["?"] * len(inputs))
+    select_sql = (
+        f"SELECT * FROM {name}({placeholders})" if placeholders else f"SELECT * FROM {name}"
+    )
+    exec_sql = (
+        f"EXECUTE PROCEDURE {name} {placeholders}" if placeholders else f"EXECUTE PROCEDURE {name}"
+    )
+    hints: List[str] = []
+    if inputs:
+        for field in inputs:
+            fname = field.get("name") or "PARAM"
+            hints.append(fname.strip() or "PARAM")
+    mapping = ", ".join(hints) if hints else "без параметри"
+    return {"select": select_sql, "execute": exec_sql, "hints": mapping}
+
+
+def _table_example(meta: Dict[str, Any]) -> str:
+    table_name = meta.get("name") or "USERS"
+    fields = meta.get("fields", {})
+    login_field = fields.get("login") or "NAME"
+    pass_field = fields.get("password") or fields.get("password_hash") or "PASS"
+    return (
+        "SELECT COUNT(*) FROM "
+        f"{table_name} WHERE UPPER(TRIM({login_field})) = UPPER(?) "
+        f"AND TRIM({pass_field}) = TRIM(?)"
+    )
+
+
 def print_meta(meta: Dict[str, Any]) -> None:
     mode = meta.get("mode")
     if mode == "sp":
@@ -87,6 +118,16 @@ def print_meta(meta: Dict[str, Any]) -> None:
             print("  Изход параметри:")
             for field in outputs:
                 print(f"    - {_format_field(field)}")
+        examples = _procedure_examples(meta)
+        print("  Пробни заявки:")
+        print(f"    - SELECT: {examples['select']}")
+        print(f"    - EXECUTE: {examples['execute']}")
+        print(f"    - Параметри: {examples['hints']}")
+        fallback = meta.get("fallback_table")
+        if isinstance(fallback, dict):
+            print("  \n  Резервен табличен вход:")
+            print(f"    - Таблица: {fallback.get('name')}")
+            print(f"    - Пробна заявка: {_table_example(fallback)}")
         return
 
     if mode == "table":
@@ -96,8 +137,13 @@ def print_meta(meta: Dict[str, Any]) -> None:
         print("  Използвани полета:")
         print(f"    - ID: {fields.get('id')}")
         print(f"    - LOGIN: {fields.get('login') or '—'}")
-        print(f"    - PASSWORD: {fields.get('password')}")
+        pass_label = fields.get('password') or fields.get('password_hash') or '—'
+        print(f"    - PASSWORD: {pass_label}")
+        if fields.get('has_hash'):
+            print("    - HASH режим: наличен (TODO конфигурация)")
         print(f"    - SALT: {fields.get('salt') or '—'}")
+        probe_sql = _table_example(meta)
+        print(f"  Пробна заявка: {probe_sql}")
         columns = meta.get("columns") or {}
         if columns:
             print("  Достъпни колони:")
@@ -131,13 +177,18 @@ def build_summary(
         proc_name = meta.get("name") or "?"
         sp_kind = meta.get("sp_kind") or "неизвестна"
         lines.append(f"Механизъм: процедура {proc_name} ({sp_kind}).")
+        examples = _procedure_examples(meta)
+        lines.append(f"SP SELECT: {examples['select']}")
+        lines.append(f"SP EXECUTE: {examples['execute']}")
         fallback = meta.get("fallback_table")
         if isinstance(fallback, dict):
             table_name = fallback.get("name") or "USERS"
             lines.append(f"Резервна таблица: {table_name}.")
+            lines.append(f"Таблична проверка: {_table_example(fallback)}")
     elif mode == "table":
         table_name = meta.get("name") or "USERS"
         lines.append(f"Механизъм: таблица {table_name}.")
+        lines.append(f"Таблична проверка: {_table_example(meta)}")
     else:
         lines.append("Механизъм: неуспешно откриване.")
 

@@ -31,6 +31,54 @@ APP_SUBTITLE = "Продукт на Микро Вижън ЕООД | тел. 088
 CLIENTS_JSON = "mistral_clients.json"
 
 
+def ensure_clients_file(path: str = CLIENTS_JSON) -> None:
+    file_path = Path(path)
+    if file_path.exists():
+        return
+    sample_profile = {
+        "name": "Local SAMPLE",
+        "host": "localhost",
+        "port": 3050,
+        "database": "C:/Mistral/data/EXAMPLE.FDB",
+        "user": "SYSDBA",
+        "password": "masterkey",
+        "charset": "WIN1251",
+        "comment": "Автоматично генериран примерен профил. Попълнете реалните стойности.",
+    }
+    payload = [sample_profile]
+    try:
+        file_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.warning(
+            "Създаден е примерен mistral_clients.json. Попълнете реални параметри преди работа."
+        )
+    except Exception as exc:
+        logger.exception("Неуспешно създаване на примерен mistral_clients.json: %s", exc)
+
+
+def _check_runtime_dependencies() -> None:
+    modules = {
+        "loguru": "loguru",
+        "PyPDF2": "PyPDF2",
+        "pdf2image": "pdf2image",
+        "PIL": "Pillow",
+        "pytesseract": "pytesseract",
+        "fdb": "fdb",
+        "firebird.driver": "firebird-driver",
+    }
+    missing: List[str] = []
+    for module_name, pip_name in modules.items():
+        try:
+            import_module(module_name)
+        except ImportError:
+            missing.append(pip_name)
+        except Exception:
+            continue
+    if missing:
+        logger.warning(
+            "Липсващи зависимости: %s", ", ".join(sorted(set(missing)))
+        )
+
+
 @dataclass
 class SessionState:
     """Държи текущото състояние на операторската сесия."""
@@ -60,6 +108,7 @@ def machine_id() -> str:
 def load_profiles(path: str = CLIENTS_JSON) -> Dict[str, Dict[str, Any]]:
     """Зарежда профилите и ги връща като {име: профил}."""
 
+    ensure_clients_file(path)
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -105,6 +154,7 @@ class MicroVisionApp:
                 logger.debug("Неуспешно зареждане на икона от %s", icon_path)
 
         self.session = SessionState()
+        _check_runtime_dependencies()
         self.profiles = load_profiles()
         self.profile_names: List[str] = list(self.profiles.keys())
         self.active_profile: Optional[Dict[str, Any]] = None
@@ -557,10 +607,16 @@ class MicroVisionApp:
             self._log("⚠️ DB режим е активен, но липсват функции за отворена доставка.")
             return
 
+        if os.getenv("MV_ENABLE_OPEN_DELIVERY", "").strip() != "1":
+            self._log("ℹ️ DB режим е в демонстрационен режим – няма да бъдат записани INSERT заявки.")
+
         try:
             start_fn(self.session)
             push_fn(self.session, rows)
-            self._log("✅ Данните са изпратени към отворена доставка.")
+            if os.getenv("MV_ENABLE_OPEN_DELIVERY", "").strip() == "1":
+                self._log("✅ Данните са изпратени към отворена доставка.")
+            else:
+                self._log("ℹ️ Данните са обработени, но не са записани в Мистрал (скелет режим).")
         except Exception as exc:
             self._report_error("Грешка при изпращане към отворена доставка.", exc)
 
