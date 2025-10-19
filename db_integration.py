@@ -199,6 +199,12 @@ def start_open_delivery(session: Any) -> int:
 
     delivery_id = create_open_delivery(int(operator_id))
     session.open_delivery_id = delivery_id
+    logger.info(
+        "Създадена е OPEN доставка (профил: %s, оператор ID: %s, доставка ID: %s)",
+        profile_label,
+        operator_id,
+        delivery_id,
+    )
     return delivery_id
 
 
@@ -227,4 +233,12 @@ def push_parsed_rows(session: Any, rows: List[Dict[str, Any]]) -> None:
         delivery_id = create_open_delivery(int(operator_id))
         session.open_delivery_id = delivery_id
 
+    operator_id = getattr(session, "user_id", None)
     push_items_to_mistral(int(delivery_id), rows)
+    logger.info(
+        "Изпратени са артикули към Мистрал (профил: %s, оператор ID: %s, доставка ID: %s, редове: %s)",
+        profile_label,
+        operator_id,
+        delivery_id,
+        len(rows),
+    )

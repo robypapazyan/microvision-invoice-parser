@@ -37,6 +37,23 @@ else:  # pragma: no cover - при липса на loguru
     logger = logging.getLogger("microvision")
 
 
+def _cleanup_old_logs(log_dir: Path, keep: int = 14) -> None:
+    try:
+        log_files = sorted(log_dir.glob("app_*.log"))
+    except Exception:  # pragma: no cover - защитно
+        return
+    if keep <= 0:
+        return
+    excess = len(log_files) - keep
+    if excess <= 0:
+        return
+    for old_file in log_files[:excess]:
+        try:
+            old_file.unlink()
+        except Exception:
+            continue
+
+
 def _configure_logging() -> None:
     global _LOG_CONFIGURED, logger
     if _LOG_CONFIGURED:
@@ -48,7 +65,11 @@ def _configure_logging() -> None:
     except Exception:  # pragma: no cover - защитно
         pass
 
-    log_level_name = os.getenv("MICROVISION_LOG_LEVEL", "INFO").upper() or "INFO"
+    log_level_name = (
+        os.getenv("MV_LOG_LEVEL")
+        or os.getenv("MICROVISION_LOG_LEVEL")
+        or "INFO"
+    ).upper() or "INFO"
 
     if _loguru_logger is not None:
         log_file = log_dir / "app_{time:YYYYMMDD}.log"
@@ -77,6 +98,7 @@ def _configure_logging() -> None:
             setattr(handler, "_microvision_daily", True)
             logger.addHandler(handler)
         logger.propagate = False
+        _cleanup_old_logs(log_dir)
 
     _LOG_CONFIGURED = True
 
@@ -95,6 +117,10 @@ def _log_with_level(level: str, message: str, **kwargs: Any) -> None:
 
 def _log_info(message: str, **kwargs: Any) -> None:
     _log_with_level("info", message, **kwargs)
+
+
+def _log_debug(message: str, **kwargs: Any) -> None:
+    _log_with_level("debug", message, **kwargs)
 
 
 def _log_warning(message: str, **kwargs: Any) -> None:
@@ -189,6 +215,17 @@ def _trace(action: str, **info: Any) -> None:
 
 def get_last_login_trace() -> List[Dict[str, Any]]:
     return list(_last_login_trace)
+
+
+def _table_meta_from_login_meta(meta: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not meta:
+        return None
+    if isinstance(meta.get("mode"), str) and meta.get("mode") == "table":
+        return meta
+    fallback = meta.get("fallback_table") if isinstance(meta, dict) else None
+    if isinstance(fallback, dict):
+        return fallback
+    return None
 
 
 def _collect_table_login_candidates() -> List[Dict[str, Any]]:
@@ -673,17 +710,43 @@ def login_user(username: str, password: str) -> Tuple[int, str]:
     if force_table:
         _trace("force_table_login", profile=_profile_label())
         _log_warning("Активиран е принудителен табличен логин.", profile=_profile_label())
-        result = _login_via_users_table(cur, username, password)
+        if _LOGIN_META is None:
+            _LOGIN_META = detect_login_method(cur)
+        meta = _LOGIN_META or {}
+        table_meta = _table_meta_from_login_meta(meta)
+        _trace(
+            "detected_mode",
+            mode=meta.get("mode"),
+            name=meta.get("name"),
+            sp_kind=meta.get("sp_kind"),
+        )
         _log_info(
-            "Успешен вход (таблица, принудително)",
+            "Открит механизъм за логин",
+            profile=_profile_label(),
+            mode=meta.get("mode"),
+            name=meta.get("name"),
+        )
+        operator_id, operator_login = _login_via_users_table(cur, username, password, table_meta)
+        _trace(
+            "success",
+            mode="table",
+            operator_id=operator_id,
+            operator_login=operator_login,
+        )
+        match_mode = "username" if username.strip() else "password"
+        _log_info(
+            "Успешен вход чрез таблица (принудително)",
             profile=_profile_label(),
             username=display_user,
+            match=match_mode,
+            operator_id=operator_id,
         )
-        return result
+        return operator_id, operator_login
 
     if _LOGIN_META is None:
         _LOGIN_META = detect_login_method(cur)
     meta = _LOGIN_META or {}
+    table_meta = _table_meta_from_login_meta(meta)
     _trace(
         "detected_mode",
         mode=meta.get("mode"),
@@ -731,17 +794,20 @@ def login_user(username: str, password: str) -> Tuple[int, str]:
                 profile=_profile_label(),
                 procedure=meta.get("name"),
             )
-        operator_id, operator_login = _login_via_users_table(cur, username, password)
+        operator_id, operator_login = _login_via_users_table(cur, username, password, table_meta)
         _trace(
             "success",
             mode="table",
             operator_id=operator_id,
             operator_login=operator_login,
         )
+        match_mode = "username" if username.strip() else "password"
         _log_info(
             "Успешен вход чрез таблица",
             profile=_profile_label(),
             username=display_user,
+            match=match_mode,
+            operator_id=operator_id,
         )
         return operator_id, operator_login
     except MistralDBError as exc:
@@ -876,48 +942,87 @@ def _login_via_procedure(
     return operator_id, operator_login
 
 
-def _login_via_users_table(cur: Any, username: str, password: str) -> Tuple[int, str]:
-    table = "USERS"
-    username = username.strip()
-    password = password.strip()
-    mode = "username" if username else "password"
+def _login_via_users_table(
+    cur: Any,
+    username: str,
+    password: str,
+    meta: Optional[Dict[str, Any]] = None,
+) -> Tuple[int, str]:
+    table = (meta or {}).get("name") or "USERS"
+    fields = (meta or {}).get("fields") or {}
+    id_field = fields.get("id") or "ID"
+    login_field = fields.get("login") or "NAME"
+    pass_field = fields.get("password") or "PASS"
 
-    query_sql = "SELECT ID, NAME, PASS FROM USERS WHERE NAME = ?" if username else "SELECT ID, NAME, PASS FROM USERS WHERE PASS = ?"
-    param_value = username if username else password
+    username_clean = username.strip()
+    password_value = password
+    mode = "username" if username_clean else "password"
+
+    clauses = [f"TRIM({pass_field}) = ?"]
+    params: List[Any] = [password_value]
+    if username_clean:
+        clauses.insert(0, f"UPPER({login_field}) = UPPER(?)")
+        params.insert(0, username_clean)
+
+    query_sql = (
+        f"SELECT {id_field}, {login_field}, {pass_field} FROM {table} WHERE "
+        + " AND ".join(clauses)
+    )
+    debug_params = (
+        {"username": username_clean, "password": "***"}
+        if username_clean
+        else {"password": "***"}
+    )
     _trace(
         "table_lookup",
         table=table,
         mode=mode,
-        username=username or None,
-        password=password,
+        username=username_clean or None,
+        password=password_value,
+        sql=query_sql,
+    )
+    _log_debug(
+        f"Табличен логин SQL: {query_sql} | params={debug_params}",
+        table=table,
+        mode=mode,
     )
 
     try:
-        cur.execute(query_sql, (param_value,))
+        cur.execute(query_sql, tuple(params))
         rows = cur.fetchall()
     except _FB_ERROR as exc:
         _trace("table_error", table=table, error=str(exc))
         raise MistralDBError(f"Грешка при четене от {table}: {exc}") from exc
 
     if not rows:
-        _trace("table_no_match", table=table, mode=mode, username=username or None)
+        _trace("table_no_match", table=table, mode=mode, username=username_clean or None)
         raise MistralDBError("Невалидни данни за вход.")
+
+    if mode == "password" and len(rows) > 1:
+        _trace(
+            "table_ambiguous",
+            table=table,
+            matches=len(rows),
+        )
+        raise MistralDBError(
+            "Паролата съответства на повече от един оператор. Моля, въведете и потребителско име."
+        )
 
     row = rows[0]
     stored_pass = "" if row[2] is None else str(row[2]).strip()
-    if username and stored_pass != password:
+    if username_clean and stored_pass != password_value:
         _trace(
             "table_no_match",
             table=table,
             mode=mode,
-            username=username,
+            username=username_clean,
             reason="password-mismatch",
         )
         raise MistralDBError("Невалидни данни за вход.")
 
     operator_id = int(row[0])
     operator_login_raw = row[1] if len(row) > 1 else None
-    operator_login = (str(operator_login_raw or "").strip()) or (username or str(operator_id))
+    operator_login = (str(operator_login_raw or "").strip()) or (username_clean or str(operator_id))
     _trace(
         "table_ok",
         table=table,

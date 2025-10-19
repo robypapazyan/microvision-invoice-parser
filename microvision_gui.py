@@ -17,7 +17,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import db_integration
-from mistral_db import get_last_login_trace, logger
+from mistral_db import logger
 
 try:  # legacy fallback
     from db_integration import operator_login_session  # type: ignore
@@ -171,7 +171,7 @@ class MicroVisionApp:
             command=self._show_login_diagnostics,
         )
         self.login_diag_btn.grid(row=0, column=8, sticky="w", padx=(4, 0))
-        self.login_diag_btn.grid_remove()
+        self.login_diag_btn.state(["disabled"])
 
         self.db_mode_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -241,46 +241,106 @@ class MicroVisionApp:
             return
         try:
             if show:
-                self.login_diag_btn.grid()
+                self.login_diag_btn.state(["!disabled"])
             else:
-                self.login_diag_btn.grid_remove()
+                self.login_diag_btn.state(["disabled"])
         except Exception:  # pragma: no cover - защитно
             pass
 
     def _show_login_diagnostics(self) -> None:
-        trace = get_last_login_trace() or self.last_login_trace
-        if not trace:
-            trace = db_integration.last_login_trace(self.session)
-        if not trace:
-            try:
-                messagebox.showinfo("Диагностика", "Няма налични данни от последния опит.")
-            except Exception:
-                pass
+        profile_name = self.active_profile_name or self.session.profile_name
+        if not profile_name:
+            self._report_error("Моля, изберете профил преди диагностика.")
             return
+
+        username = self.username_var.get().strip()
+        password = self.password_var.get()
+        if not password:
+            try:
+                from tkinter import simpledialog
+
+                password = simpledialog.askstring(
+                    "Диагностика",
+                    "Въведете паролата за тест на входа:",
+                    show="•",
+                    parent=self.root,
+                ) or ""
+            except Exception:
+                password = ""
+        if not password:
+            self._log("⚠️ Диагностиката е отменена – липсва парола.")
+            return
+
+        script_path = Path(__file__).with_name("diag_mistral_auth.py")
+        if not script_path.exists():
+            self._report_error("Липсва скриптът за диагностика (diag_mistral_auth.py).")
+            return
+
+        cmd = [sys.executable, str(script_path), "--profile", profile_name]
+        if username:
+            cmd.extend(["--user", username])
+        if password:
+            cmd.extend(["--password", password])
+        if os.getenv("MV_FORCE_TABLE_LOGIN", "").strip() == "1":
+            cmd.append("--force-table")
+
+        self._log("🔎 Стартирам диагностика на входа…")
+        logger.info(
+            "Стартирана е диагностика (профил: %s, потребител: %s)",
+            profile_name,
+            username or "<само парола>",
+        )
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except Exception as exc:
+            self._report_error("Неуспешно стартиране на диагностиката.", exc)
+            return
+
+        summary_prefix = "SUMMARY:"
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+        summary_lines = [
+            line.split(summary_prefix, 1)[1].strip()
+            for line in stdout.splitlines()
+            if line.startswith(summary_prefix)
+        ]
+
+        if result.returncode != 0:
+            error_line = stderr.strip().splitlines()[-1] if stderr.strip() else "Неуспешно изпълнение."
+            summary_lines.append(f"Диагностиката приключи с код {result.returncode}: {error_line}")
+
+        if not summary_lines:
+            summary_lines = [line for line in stdout.splitlines() if line.strip()][:5]
+        if not summary_lines:
+            summary_lines = ["Няма налично обобщение от диагностиката."]
+
+        self._log("📋 Обобщение от диагностика:")
+        for item in summary_lines:
+            self._log(f"  • {item}")
 
         dialog = tk.Toplevel(self.root)
         dialog.title("Диагностика на входа")
         dialog.transient(self.root)
         dialog.grab_set()
-        dialog.resizable(True, True)
+        dialog.resizable(True, False)
 
         frame = ttk.Frame(dialog, padding=12)
         frame.pack(fill="both", expand=True)
 
-        text = tk.Text(frame, width=80, height=18, wrap="word")
-        text.pack(side="left", fill="both", expand=True)
-        scrollbar = ttk.Scrollbar(frame, command=text.yview)
-        scrollbar.pack(side="right", fill="y")
-        text.configure(yscrollcommand=scrollbar.set)
+        text = tk.Text(frame, width=80, height=len(summary_lines) + 2, wrap="word")
+        text.pack(fill="both", expand=True)
         text.configure(font="TkFixedFont")
-
-        trace_json = json.dumps(trace, ensure_ascii=False, indent=2)
-        if not trace_json.strip():
-            trace_json = "[]"
-        text.insert("1.0", trace_json)
+        text.insert("1.0", "\n".join(summary_lines))
         text.configure(state="disabled")
 
-        ttk.Button(dialog, text="Затвори", command=dialog.destroy).pack(pady=(4, 0))
+        ttk.Button(dialog, text="Затвори", command=dialog.destroy).pack(pady=(6, 0))
         dialog.bind("<Escape>", lambda _e: dialog.destroy())
 
     def _on_profile_change(self, _evt: Optional[tk.Event] = None) -> None:
@@ -365,7 +425,7 @@ class MicroVisionApp:
             self.session.last_login_trace = self.last_login_trace
             self.login_status_var.set("Вход: неуспешен.")
             self._log(f"❌ {message}")
-            self._toggle_login_diag_button(bool(self.last_login_trace))
+            self._toggle_login_diag_button(True)
             try:
                 messagebox.showerror("Вход", message)
             except Exception:
@@ -392,7 +452,7 @@ class MicroVisionApp:
         self.login_status_var.set(f"Вход: {display_user}{suffix}")
         self._log(f"✅ Успешен вход: {display_user}{suffix}")
         self.password_var.set("")
-        self._toggle_login_diag_button(False)
+        self._toggle_login_diag_button(True)
         self._refresh_license_text()
 
     def _legacy_login_bridge(self, username: str, password: str) -> Optional[Dict[str, Any]]:
