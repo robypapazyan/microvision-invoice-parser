@@ -428,11 +428,7 @@ def connect(profile: Dict[str, Any]) -> Tuple[Any, Any]:
     )
 
     logger.info(
-        "Свързване към база (профил: {profile}, host={host}, database={db}, driver={driver}).",
-        profile=profile_label,
-        host=host,
-        db=database,
-        driver=_FB_API,
+        f"Свързване към база (профил: {profile_label}, host={host}, database={database}, driver={_FB_API})."
     )
     try:
         conn = _connect_raw(host, port, database, user, password, charset)
@@ -534,7 +530,7 @@ def detect_login_method(cur: Any | None = None) -> Dict[str, Any]:
                     "outputs": outputs,
                 },
             }
-            logger.info("Открита login процедура: {name} ({kind}).", name=name, kind=sp_kind)
+            logger.info(f"Открита login процедура: {name} ({sp_kind}).")
             return meta
 
     table_candidates: List[Dict[str, Any]] = []
@@ -592,11 +588,10 @@ def detect_login_method(cur: Any | None = None) -> Dict[str, Any]:
     if table_candidates:
         primary = dict(table_candidates[0])
         primary["candidates"] = table_candidates
+        has_name = "да" if primary["fields"].get("has_name") else "не"
+        has_pass = "да" if primary["fields"].get("has_pass") else "не"
         logger.info(
-            "Открит login чрез таблица: {table} (NAME={has_name}, PASS={has_pass}).",
-            table=primary["name"],
-            has_name="да" if primary["fields"].get("has_name") else "не",
-            has_pass="да" if primary["fields"].get("has_pass") else "не",
+            f"Открит login чрез таблица: {primary['name']} (NAME={has_name}, PASS={has_pass})."
         )
         return primary
 
