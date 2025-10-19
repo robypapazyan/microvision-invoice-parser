@@ -90,6 +90,8 @@ class SessionState:
     raw_login_payload: Any = None
     db_mode: bool = False
     last_login_trace: Optional[List[Dict[str, Any]]] = None
+    password: str = ""
+    ui_root: Any = None
 
 
 
@@ -220,6 +222,7 @@ class MicroVisionApp:
                 logger.debug("Неуспешно зареждане на икона от %s", icon_path)
 
         self.session = SessionState()
+        self.session.ui_root = self.root
         _check_runtime_dependencies()
         self.profiles = load_profiles()
         self.profile_names: List[str] = list(self.profiles.keys())
@@ -312,6 +315,7 @@ class MicroVisionApp:
         outfrm.pack(side="top", fill="both", expand=True)
         self.output_text = tk.Text(outfrm, height=18, wrap="word")
         self.output_text.pack(side="left", fill="both", expand=True)
+        self.output_text.configure(font="TkFixedFont")
         yscroll = ttk.Scrollbar(outfrm, command=self.output_text.yview)
         yscroll.pack(side="right", fill="y")
         self.output_text.configure(yscrollcommand=yscroll.set)
@@ -373,8 +377,8 @@ class MicroVisionApp:
             self._report_error("Моля, изберете профил преди диагностика.")
             return
 
-        username = self.username_var.get().strip()
-        password = self.password_var.get()
+        username = self.username_var.get().strip() or self.session.username
+        password = self.password_var.get() or getattr(self.session, "password", "")
         if not password:
             try:
                 from tkinter import simpledialog
@@ -446,6 +450,25 @@ class MicroVisionApp:
             try:
                 diag_info = diag_fn(self.session)
                 diag_lines: List[str] = []
+                schema_info = diag_info.get("schema") or {}
+                if isinstance(schema_info, dict) and schema_info.get("materials_table"):
+                    diag_lines.append(
+                        "Каталожна таблица: {0} (код={1}, име={2})".format(
+                            schema_info.get("materials_table"),
+                            schema_info.get("materials_code") or "—",
+                            schema_info.get("materials_name") or "—",
+                        )
+                    )
+                if isinstance(schema_info, dict) and schema_info.get("barcode_table"):
+                    diag_lines.append(
+                        "Таблица баркодове: {0} (колона={1}, FK={2})".format(
+                            schema_info.get("barcode_table"),
+                            schema_info.get("barcode_col") or "—",
+                            schema_info.get("barcode_mat_fk") or "—",
+                        )
+                    )
+                if diag_info.get("schema_error"):
+                    diag_lines.append(f"Схема: грешка ({diag_info['schema_error']})")
                 materials_count = diag_info.get("materials_count")
                 if materials_count is not None:
                     diag_lines.append(f"Материали в БД: {materials_count}")
@@ -529,6 +552,7 @@ class MicroVisionApp:
         self.session.user_id = None
         self.session.raw_login_payload = None
         self.session.last_login_trace = None
+        self.session.password = ""
         self.last_login_trace = []
         self.username_var.set("")
         self.password_var.set("")
@@ -588,6 +612,7 @@ class MicroVisionApp:
             trace = result.get("trace") or db_integration.last_login_trace(self.session)
             self.last_login_trace = trace or []
             self.session.last_login_trace = self.last_login_trace
+            self.session.password = ""
             self.login_status_var.set("Вход: неуспешен.")
             self._log(f"❌ {message}")
             self._toggle_login_diag_button(True)
@@ -611,6 +636,7 @@ class MicroVisionApp:
         self.session.raw_login_payload = result
         self.last_login_trace = db_integration.last_login_trace(self.session)
         self.session.last_login_trace = self.last_login_trace
+        self.session.password = password
 
         display_user = effective_username or ("само парола" if not username else username)
         suffix = f" (ID: {user_id})" if user_id is not None else ""
@@ -711,10 +737,11 @@ class MicroVisionApp:
         self._log(f"✅ Разпознати редове: {count}")
         self._preview_rows(rows)
 
-        final_items = [row.get("final_item") for row in rows if row.get("final_item")]
+        if self.session.db_mode:
+            self._push_to_open_delivery(self.rows_cache)
+            self._update_status_summary(self.rows_cache)
 
-        if self.session.db_mode and final_items:
-            self._push_to_open_delivery(final_items)
+        final_items = [row.get("final_item") for row in self.rows_cache if row.get("final_item")]
 
         if final_items:
             self._offer_export(final_items, file_path)
@@ -816,7 +843,7 @@ class MicroVisionApp:
         if len(rows) > preview_count:
             self._log(f"  … още {len(rows) - preview_count} реда.")
 
-    def _push_to_open_delivery(self, items: List[Dict[str, Any]]) -> None:
+    def _push_to_open_delivery(self, rows: List[Dict[str, Any]]) -> None:
         start_fn = getattr(db_integration, "start_open_delivery", None)
         push_fn = getattr(db_integration, "push_parsed_rows", None)
         if not (callable(start_fn) and callable(push_fn)):
@@ -828,11 +855,20 @@ class MicroVisionApp:
 
         try:
             start_fn(self.session)
-            push_fn(self.session, items)
+            push_fn(self.session, rows)
             if os.getenv("MV_ENABLE_OPEN_DELIVERY", "").strip() == "1":
                 self._log("✅ Данните са изпратени към отворена доставка.")
             else:
                 self._log("ℹ️ Данните са обработени, но не са записани в Мистрал (скелет режим).")
+            stats = getattr(self.session, "last_push_stats", None)
+            if isinstance(stats, dict):
+                total = stats.get("total", 0)
+                resolved = stats.get("resolved", 0)
+                unresolved = stats.get("unresolved", 0)
+                manual = stats.get("manual", 0)
+                self._log(
+                    f"📦 Статистика: общо {total} | записани {resolved} | нерешени {unresolved} | ръчни избори {manual}"
+                )
         except Exception as exc:
             self._report_error("Грешка при изпращане към отворена доставка.", exc)
 

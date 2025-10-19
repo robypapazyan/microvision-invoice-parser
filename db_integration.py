@@ -12,10 +12,11 @@ from mistral_db import (  # type: ignore[attr-defined]
     MistralDBError,
     connect,
     create_open_delivery,
-    db_find_by_barcode,
-    db_find_by_code,
-    db_find_by_name_like,
     db_resolve_item,
+    detect_catalog_schema,
+    find_item_candidates_by_name,
+    get_item_by_barcode,
+    get_item_by_code,
     get_last_login_trace,
     logger,
     login_user,
@@ -125,6 +126,27 @@ def _extract_token_from_row(row: Dict[str, Any]) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return ""
+
+
+def _first_nonempty(row: Dict[str, Any], keys: Iterable[str]) -> Optional[str]:
+    for key in keys:
+        if key not in row:
+            continue
+        value = row.get(key)
+        if value in (None, ""):
+            continue
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned:
+                return cleaned
+        else:
+            try:
+                text = str(value).strip()
+            except Exception:  # pragma: no cover - защитно
+                continue
+            if text:
+                return text
+    return None
 
 
 def _fallback_from_material(code: str) -> Optional[Dict[str, Any]]:
@@ -255,6 +277,100 @@ def apply_candidate_choice(row: Dict[str, Any], candidate: Dict[str, Any], sourc
     return row
 
 
+def _candidate_summary(candidate: Dict[str, Any]) -> str:
+    code = candidate.get("code") or "—"
+    name = candidate.get("name") or "без име"
+    uom = candidate.get("uom") or candidate.get("measure") or ""
+    price = candidate.get("price")
+    if isinstance(price, Decimal):
+        price_text = f"{price:.2f}"
+    elif price not in (None, ""):
+        price_text = str(price)
+    else:
+        price_text = "—"
+    parts = [code, name]
+    if uom:
+        parts.append(uom)
+    parts.append(f"цена: {price_text}")
+    return " | ".join(parts)
+
+
+def _choose_candidate_dialog(
+    session: Any, token: str, candidates: List[Dict[str, Any]]
+) -> Optional[int | str]:
+    root = getattr(session, "ui_root", None)
+    if root is None:
+        return None
+    try:
+        import tkinter as tk
+        from tkinter import ttk
+    except Exception:
+        return None
+
+    result: Dict[str, Any] = {"value": None}
+
+    dialog = tk.Toplevel(root)
+    dialog.title("Избор на артикул")
+    dialog.transient(root)
+    dialog.grab_set()
+    dialog.resizable(False, False)
+
+    frame = ttk.Frame(dialog, padding=12)
+    frame.pack(fill="both", expand=True)
+
+    ttk.Label(frame, text="Разпознат ред:", font=("Segoe UI", 9, "bold")).pack(anchor="w")
+    preview = tk.Text(frame, height=2, width=60, wrap="word")
+    preview.pack(fill="x", pady=(0, 8))
+    preview.insert("1.0", token)
+    preview.configure(state="disabled", font="TkFixedFont")
+
+    ttk.Label(frame, text="Моля, изберете правилния артикул:").pack(anchor="w")
+    listbox = tk.Listbox(frame, height=min(6, len(candidates)), exportselection=False)
+    for idx, candidate in enumerate(candidates):
+        listbox.insert(idx, _candidate_summary(candidate))
+    listbox.pack(fill="both", expand=True, pady=(4, 8))
+
+    buttons = ttk.Frame(frame)
+    buttons.pack(fill="x")
+
+    def _set_result(value: Any) -> None:
+        result["value"] = value
+        dialog.destroy()
+
+    def _trigger_select() -> None:
+        selection = listbox.curselection()
+        if selection:
+            _set_result(selection[0])
+
+    select_btn = ttk.Button(buttons, text="Избери", command=_trigger_select)
+    select_btn.pack(side="left")
+    skip_btn = ttk.Button(buttons, text="Пропусни", command=lambda: _set_result("skip"))
+    skip_btn.pack(side="left", padx=(8, 0))
+    cancel_btn = ttk.Button(buttons, text="Отказ", command=lambda: _set_result("cancel"))
+    cancel_btn.pack(side="right")
+
+    def _on_select(_event: Any = None) -> None:
+        selection = listbox.curselection()
+        if selection:
+            _set_result(selection[0])
+
+    def _on_change(_event: Any = None) -> None:
+        if listbox.curselection():
+            select_btn.state(["!disabled"])
+        else:
+            select_btn.state(["disabled"])
+
+    listbox.bind("<<ListboxSelect>>", _on_change)
+    listbox.bind("<Double-Button-1>", _on_select)
+    dialog.bind("<Return>", _on_select)
+    dialog.bind("<Escape>", lambda _e: _set_result("cancel"))
+    dialog.protocol("WM_DELETE_WINDOW", lambda: _set_result("cancel"))
+
+    select_btn.state(["disabled"])
+    root.wait_window(dialog)
+    return result.get("value")
+
+
 def resolve_items_from_db(session: Any, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not rows:
         return []
@@ -269,6 +385,11 @@ def resolve_items_from_db(session: Any, rows: List[Dict[str, Any]]) -> List[Dict
     }
 
     cur = getattr(session, "cur", None) if use_db else None
+    if use_db and cur is not None:
+        try:
+            detect_catalog_schema(cur)
+        except MistralDBError as exc:
+            logger.warning("Неуспешно откриване на каталожната схема: %s", exc)
     resolved_rows: List[Dict[str, Any]] = []
     for row in rows:
         working = dict(row)
@@ -328,48 +449,82 @@ def collect_db_diagnostics(session: Any) -> Dict[str, Any]:
     diagnostics: Dict[str, Any] = {"profile": profile_label}
 
     try:
-        active_cur.execute("SELECT COUNT(*) FROM MATERIAL")
-        diagnostics["materials_count"] = active_cur.fetchone()[0]
-    except Exception as exc:
-        diagnostics["materials_error"] = str(exc)
+        schema = detect_catalog_schema(active_cur)
+    except MistralDBError as exc:
+        diagnostics["schema_error"] = str(exc)
+        schema = {}
 
-    try:
-        active_cur.execute("SELECT COUNT(*) FROM BARCODE")
-        diagnostics["barcode_count"] = active_cur.fetchone()[0]
-    except Exception as exc:
-        diagnostics["barcode_error"] = str(exc)
+    diagnostics["schema"] = schema
 
-    try:
-        active_cur.execute(
-            "SELECT FIRST 1 b.BARCODE FROM BARCODE b WHERE b.BARCODE IS NOT NULL"
-        )
-        barcode_row = active_cur.fetchone()
-        if barcode_row and barcode_row[0]:
-            sample_barcode = str(barcode_row[0]).strip()
-            diagnostics["sample_barcode"] = sample_barcode
-            diagnostics["sample_barcode_matches"] = db_find_by_barcode(active_cur, sample_barcode)
-    except Exception as exc:
-        diagnostics["sample_barcode_error"] = str(exc)
+    materials_table = schema.get("materials_table") if isinstance(schema, dict) else None
+    barcode_table = schema.get("barcode_table") if isinstance(schema, dict) else None
+    materials_code = schema.get("materials_code") if isinstance(schema, dict) else None
+    materials_name = schema.get("materials_name") if isinstance(schema, dict) else None
+    barcode_col = schema.get("barcode_col") if isinstance(schema, dict) else None
 
-    try:
-        active_cur.execute(
-            "SELECT FIRST 1 m.CODE, mn.NAME FROM MATERIAL m "
-            "LEFT JOIN MATERIALNAME mn ON mn.MATERIAL = m.ID AND mn.ISDEFAULT = 1 "
-            "WHERE m.CODE IS NOT NULL ORDER BY m.CODE"
-        )
-        row = active_cur.fetchone()
-        if row:
-            code_sample = str(row[0]).strip()
-            name_sample = str(row[1] or "").strip()
-            diagnostics["sample_code"] = code_sample
-            diagnostics["sample_name"] = name_sample
-            diagnostics["sample_code_matches"] = db_find_by_code(active_cur, code_sample)
-            if name_sample:
-                diagnostics["sample_name_matches"] = db_find_by_name_like(
-                    active_cur, name_sample, limit=3
+    if materials_table:
+        try:
+            active_cur.execute(f"SELECT COUNT(*) FROM {materials_table}")
+            diagnostics["materials_count"] = active_cur.fetchone()[0]
+        except Exception as exc:
+            diagnostics["materials_error"] = str(exc)
+    else:
+        diagnostics["materials_error"] = "Не е открита таблица с материали."
+
+    if barcode_table:
+        try:
+            active_cur.execute(f"SELECT COUNT(*) FROM {barcode_table}")
+            diagnostics["barcode_count"] = active_cur.fetchone()[0]
+        except Exception as exc:
+            diagnostics["barcode_error"] = str(exc)
+    elif barcode_col:
+        diagnostics["barcode_error"] = "Не е открита таблица за баркодове."
+
+    if barcode_table and barcode_col:
+        try:
+            active_cur.execute(
+                f"SELECT FIRST 1 TRIM({barcode_col}) FROM {barcode_table} "
+                f"WHERE TRIM({barcode_col}) <> ''"
+            )
+            row = active_cur.fetchone()
+            if row and row[0]:
+                barcode_value = str(row[0]).strip()
+                diagnostics["sample_barcode"] = barcode_value
+                item = get_item_by_barcode(active_cur, barcode_value)
+                diagnostics["sample_barcode_matches"] = [item] if item else []
+        except Exception as exc:
+            diagnostics["sample_barcode_error"] = str(exc)
+
+    if materials_table and materials_code:
+        try:
+            active_cur.execute(
+                f"SELECT FIRST 1 TRIM({materials_code}) FROM {materials_table} "
+                f"WHERE TRIM({materials_code}) <> '' ORDER BY {materials_code}"
+            )
+            row = active_cur.fetchone()
+            if row and row[0]:
+                code_value = str(row[0]).strip()
+                diagnostics["sample_code"] = code_value
+                item = get_item_by_code(active_cur, code_value)
+                diagnostics["sample_code_matches"] = [item] if item else []
+        except Exception as exc:
+            diagnostics["sample_code_error"] = str(exc)
+
+    if materials_table and materials_name:
+        try:
+            active_cur.execute(
+                f"SELECT FIRST 1 TRIM({materials_name}) FROM {materials_table} "
+                f"WHERE TRIM({materials_name}) <> '' ORDER BY CHAR_LENGTH(TRIM({materials_name}))"
+            )
+            row = active_cur.fetchone()
+            if row and row[0]:
+                name_value = str(row[0]).strip()
+                diagnostics["sample_name"] = name_value
+                diagnostics["sample_name_matches"] = find_item_candidates_by_name(
+                    active_cur, name_value, limit=3
                 )
-    except Exception as exc:
-        diagnostics["sample_material_error"] = str(exc)
+        except Exception as exc:
+            diagnostics["sample_name_error"] = str(exc)
 
     return diagnostics
 
@@ -575,8 +730,8 @@ def push_parsed_rows(session: Any, rows: List[Dict[str, Any]]) -> None:
         return
 
     profile_label, profile = _resolve_profile(session)
-    _ensure_connection(session, profile_label, profile)
-    _require_cursor()
+    conn, cur = _ensure_connection(session, profile_label, profile)
+    active_cur = _require_cursor(conn, cur, profile_label)
 
     delivery_id = getattr(session, "open_delivery_id", None)
     if delivery_id is None:
@@ -586,12 +741,114 @@ def push_parsed_rows(session: Any, rows: List[Dict[str, Any]]) -> None:
         delivery_id = create_open_delivery(int(operator_id))
         session.open_delivery_id = delivery_id
 
+    detect_catalog_schema(active_cur)
+
+    barcode_keys = ("barcode", "Баркод", "EAN", "ean", "Barcode")
+    code_keys = ("code", "Номер", "Артикул", "item_code", "internal_code")
+    name_keys = (
+        "name",
+        "description",
+        "product",
+        "Име",
+        "Описание",
+        "Наименование",
+    )
+
+    final_items: List[Dict[str, Any]] = []
+    manual_choices = 0
+    unresolved = 0
+    resolved = 0
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        token = row.get("token") or _extract_token_from_row(row)
+        if row.get("final_item"):
+            final_items.append(row["final_item"])
+            resolved += 1
+            continue
+
+        candidate: Optional[Dict[str, Any]] = None
+        match_kind = ""
+
+        barcode = _first_nonempty(row, barcode_keys)
+        code = _first_nonempty(row, code_keys)
+        name = _first_nonempty(row, name_keys)
+
+        if barcode:
+            candidate = get_item_by_barcode(active_cur, barcode)
+            if candidate:
+                match_kind = "barcode"
+        if candidate is None and code:
+            candidate = get_item_by_code(active_cur, code)
+            if candidate:
+                match_kind = "code"
+        if candidate is None and name:
+            name_candidates = find_item_candidates_by_name(active_cur, name, limit=3)
+            if len(name_candidates) == 1:
+                candidate = name_candidates[0]
+                match_kind = "name"
+            elif 1 < len(name_candidates) <= 3:
+                manual_choices += 1
+                choice = _choose_candidate_dialog(session, token or name, name_candidates)
+                if choice == "cancel":
+                    raise MistralDBError("Изборът на артикул е отменен от потребителя.")
+                if isinstance(choice, int) and 0 <= choice < len(name_candidates):
+                    candidate = name_candidates[choice]
+                    match_kind = "name"
+                else:
+                    row["resolved"] = None
+                    row["final_item"] = None
+                    unresolved += 1
+                    logger.info("Редът остава нерешен след избор на 'Пропусни'.")
+                    continue
+
+        if not candidate:
+            row["resolved"] = None
+            row["final_item"] = None
+            unresolved += 1
+            logger.info("Редът остана нерезолвиран (token=%s).", token or "<празно>")
+            continue
+
+        candidate_payload = dict(candidate)
+        candidate_payload["source"] = "db"
+        candidate_payload["match"] = match_kind or "db"
+        apply_candidate_choice(row, candidate_payload, "db")
+        final_items.append(row["final_item"])
+        resolved += 1
+
+    if not final_items:
+        logger.warning("Няма резолвирани редове за изпращане към Мистрал.")
+        session.last_push_stats = {
+            "profile": profile_label,
+            "total": len(rows),
+            "resolved": 0,
+            "manual": manual_choices,
+            "unresolved": unresolved,
+        }
+        return
+
+    try:
+        push_items_to_mistral(int(delivery_id), final_items)
+    except MistralDBError:
+        raise
+    except Exception as exc:
+        raise MistralDBError(f"Неуспешно записване на редовете в Мистрал: {exc}") from exc
+
     operator_id = getattr(session, "user_id", None)
-    push_items_to_mistral(int(delivery_id), rows)
     logger.info(
-        "Изпратени са артикули към Мистрал (профил: %s, оператор ID: %s, доставка ID: %s, редове: %s)",
+        "Изпратени са артикули към Мистрал (профил: %s, оператор ID: %s, доставка ID: %s, редове: %s, нерешени: %s, ръчни избори: %s)",
         profile_label,
         operator_id,
         delivery_id,
-        len(rows),
+        len(final_items),
+        unresolved,
+        manual_choices,
     )
+    session.last_push_stats = {
+        "profile": profile_label,
+        "total": len(rows),
+        "resolved": resolved,
+        "manual": manual_choices,
+        "unresolved": unresolved,
+    }

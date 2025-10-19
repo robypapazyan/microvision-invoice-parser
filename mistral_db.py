@@ -6,7 +6,7 @@ import logging
 import os
 from contextlib import contextmanager
 from datetime import datetime, date
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 # logging handlers are imported lazily in the configuration helper
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -27,6 +27,7 @@ _LOGIN_META: Dict[str, Any] | None = None
 _DELIVERY_TABLES: Dict[str, str] | None = None
 _DELIVERY_GENERATORS: Dict[str, Optional[str]] | None = None
 _TABLE_COLUMNS: Dict[str, Dict[str, Dict[str, Any]]] = {}
+_CATALOG_SCHEMA: Dict[str, str | None] | None = None
 _DELIVERY_CONTEXT: Dict[int, Dict[str, Any]] = {}
 _last_login_trace: List[Dict[str, Any]] = []
 
@@ -435,6 +436,448 @@ def _next_id(table: str, generator_hint: Optional[str]) -> int:
     return int(value or 1)
 
 
+def _collect_relation_columns(cur: Any) -> Dict[str, List[str]]:
+    mapping: Dict[str, List[str]] = {}
+    try:
+        cur.execute(
+            """
+            SELECT
+                TRIM(rf.rdb$relation_name) AS relation_name,
+                TRIM(rf.rdb$field_name) AS column_name
+            FROM rdb$relation_fields rf
+            JOIN rdb$relations r ON r.rdb$relation_name = rf.rdb$relation_name
+            WHERE (r.rdb$system_flag IS NULL OR r.rdb$system_flag = 0)
+            ORDER BY relation_name, rf.rdb$field_position
+            """
+        )
+    except _FB_ERROR as exc:
+        _log_warning("Нямам достъп до RDB$ метаданни: %s", error=str(exc))
+        return {}
+    rows = cur.fetchall() or []
+    for rel_name, col_name in rows:
+        if not rel_name:
+            continue
+        table = str(rel_name).strip().upper()
+        column = str(col_name or "").strip().upper()
+        if not column:
+            continue
+        mapping.setdefault(table, []).append(column)
+    return mapping
+
+
+def _parse_schema_dump() -> Dict[str, List[str]]:
+    schema_file = Path(__file__).with_name("schema_TESTBARBERSHOP.sql")
+    if not schema_file.exists():
+        return {}
+    try:
+        content = schema_file.read_text(encoding="cp1251", errors="ignore")
+    except Exception as exc:  # pragma: no cover - защитно
+        _log_warning("Неуспешно четене на schema dump: %s", error=str(exc))
+        return {}
+
+    tables: Dict[str, List[str]] = {}
+    create_re = re.compile(r"CREATE\s+TABLE\s+\"?([A-Z0-9_]+)\"?\s*\((.*?)\);", re.IGNORECASE | re.DOTALL)
+    for match in create_re.finditer(content):
+        table = match.group(1).upper()
+        body = match.group(2)
+        columns: List[str] = []
+        for raw_line in body.splitlines():
+            line = raw_line.strip().rstrip(",")
+            if not line:
+                continue
+            upper_line = line.upper()
+            if upper_line.startswith(("CONSTRAINT", "PRIMARY", "FOREIGN", "UNIQUE", "CHECK")):
+                continue
+            col_match = re.match(r'"?([A-Z0-9_]+)"?', line, re.IGNORECASE)
+            if not col_match:
+                continue
+            columns.append(col_match.group(1).upper())
+        if columns:
+            tables[table] = columns
+    if not tables:
+        _log_warning("Не успях да извлека таблици от schema dump.")
+    else:
+        _log_debug("Схема от dump е заредена.", tables=len(tables))
+    return tables
+
+
+def _select_column_by_patterns(columns: List[str], patterns: Sequence[str]) -> Optional[str]:
+    if not columns:
+        return None
+    normalized = [col.upper() for col in columns]
+    for pattern in patterns:
+        pattern_up = pattern.upper()
+        if pattern_up in normalized:
+            return columns[normalized.index(pattern_up)]
+    for pattern in patterns:
+        pattern_up = pattern.upper()
+        for idx, column in enumerate(columns):
+            if pattern_up in column.upper():
+                return columns[idx]
+    return None
+
+
+def _contains_pattern(columns: List[str], patterns: Sequence[str]) -> bool:
+    return _select_column_by_patterns(columns, patterns) is not None
+
+
+def _score_material_table(table: str, columns: List[str]) -> float:
+    score = 0.0
+    upper_table = table.upper()
+    if "MATER" in upper_table:
+        score += 3
+    if any(token in upper_table for token in ("ITEM", "PRODUCT", "GOOD")):
+        score += 2
+    if _contains_pattern(columns, ["CODE", "ART", "ARTIC", "SKU", "INTERNALCODE", "NOMER", "NUMBER"]):
+        score += 2.5
+    if _contains_pattern(columns, ["NAME", "MATERIAL", "DESCR", "TITLE", "FULLNAME"]):
+        score += 2.5
+    if _contains_pattern(columns, ["PRICE", "CENA", "VALUE", "COST", "LASTPRICE", "SALEPRICE", "PURCHASEPRICE"]):
+        score += 1.5
+    if _contains_pattern(columns, ["VAT", "DDS", "TAX", "TAXRATE"]):
+        score += 1.0
+    if _contains_pattern(columns, ["UNIT", "MEASURE", "MEAS", "UOM", "EDIN", "EDIZM"]):
+        score += 0.5
+    return score
+
+
+def _score_barcode_table(table: str, columns: List[str]) -> float:
+    score = 0.0
+    upper_table = table.upper()
+    if "BARC" in upper_table:
+        score += 3
+    if _contains_pattern(columns, ["BARCODE", "EAN", "EAN13", "UPC", "CODE"]):
+        score += 2.5
+    if _contains_pattern(columns, ["MATERIAL", "ITEM", "GOOD", "PRODUCT", "MAT", "ID"]):
+        score += 1.0
+    return score
+
+
+def _detect_catalog_schema_from_map(columns_map: Dict[str, List[str]]) -> Dict[str, str | None]:
+    if not columns_map:
+        return {}
+
+    best_material: tuple[str, float] | None = None
+    for table, columns in columns_map.items():
+        score = _score_material_table(table, columns)
+        if best_material is None or score > best_material[1]:
+            best_material = (table, score)
+
+    if not best_material or best_material[1] < 3:
+        raise MistralDBError("Не успях да открия таблица с материали. Нужна е ръчна конфигурация.")
+
+    materials_table = best_material[0]
+    materials_columns = columns_map[materials_table]
+    id_col = _select_column_by_patterns(
+        materials_columns,
+        ["ID", f"{materials_table}_ID", "MATERIAL", "MATERIALID", "MATID", "ITEMID"],
+    )
+    code_col = _select_column_by_patterns(
+        materials_columns,
+        [
+            "CODE",
+            "MATERIALCODE",
+            "ARTIC",
+            "ARTICLE",
+            "ARTNOMER",
+            "INTERNALCODE",
+            "NOMER",
+        ],
+    )
+    name_col = _select_column_by_patterns(
+        materials_columns,
+        ["NAME", "MATERIAL", "DESCR", "DESCRIPTION", "SEARCHNAME", "FULLNAME"],
+    )
+    uom_col = _select_column_by_patterns(
+        materials_columns,
+        ["UOM", "MEASURE", "MEASUREUNIT", "UNIT", "EDIN", "EDIZM"],
+    )
+    price_col = _select_column_by_patterns(
+        materials_columns,
+        [
+            "PRICE",
+            "LASTPRICE",
+            "LASTDELIVERYPRICE",
+            "SALEPRICE",
+            "DELIVERYPRICE",
+            "PURCHASEPRICE",
+        ],
+    )
+    vat_col = _select_column_by_patterns(
+        materials_columns,
+        ["VAT", "DDS", "TAX", "TAXRATE", "TAXPERCENTAGE", "DDSPROC"],
+    )
+
+    barcode_table: Optional[str] = None
+    barcode_columns: List[str] = []
+    best_barcode: tuple[str, float] | None = None
+    for table, columns in columns_map.items():
+        if table == materials_table:
+            continue
+        score = _score_barcode_table(table, columns)
+        if best_barcode is None or score > best_barcode[1]:
+            best_barcode = (table, score)
+    if best_barcode and best_barcode[1] >= 3:
+        barcode_table = best_barcode[0]
+        barcode_columns = columns_map.get(barcode_table, [])
+
+    barcode_col = None
+    barcode_fk = None
+    if barcode_table:
+        barcode_col = _select_column_by_patterns(
+            barcode_columns,
+            ["BARCODE", "EAN", "EAN13", "CODE", "UPC"],
+        )
+        barcode_fk = _select_column_by_patterns(
+            barcode_columns,
+            [
+                "MATERIAL",
+                "MATERIALID",
+                "MAT",
+                "ITEM",
+                "ITEMID",
+                "GOOD",
+                "PRODUCT",
+                "IDMATERIAL",
+            ],
+        )
+
+    schema = {
+        "materials_table": materials_table,
+        "materials_id": id_col,
+        "materials_code": code_col,
+        "materials_name": name_col,
+        "materials_uom": uom_col,
+        "materials_price": price_col,
+        "materials_vat": vat_col,
+        "barcode_table": barcode_table,
+        "barcode_col": barcode_col,
+        "barcode_mat_fk": barcode_fk,
+    }
+
+    _log_info(
+        "Детектирана е каталожната схема",
+        materials_table=materials_table,
+        barcode_table=barcode_table or "<няма>",
+        code_col=code_col or "<няма>",
+        name_col=name_col or "<няма>",
+    )
+    return schema
+
+
+def detect_catalog_schema(cur: Any | None = None, force_refresh: bool = False) -> Dict[str, str | None]:
+    """Открива ключовите таблици и колони за артикули и баркодове."""
+
+    global _CATALOG_SCHEMA
+    if _CATALOG_SCHEMA is not None and not force_refresh:
+        return dict(_CATALOG_SCHEMA)
+
+    active_cur = _require_cursor(cur=cur)
+    columns_map = _collect_relation_columns(active_cur)
+    if not columns_map:
+        columns_map = _parse_schema_dump()
+    schema = _detect_catalog_schema_from_map(columns_map)
+    _CATALOG_SCHEMA = dict(schema)
+    return schema
+
+
+def _clean_string(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    try:
+        text = str(value).strip()
+    except Exception:  # pragma: no cover - защитно
+        return None
+    return text or None
+
+
+def _decimal_or_none(value: Any) -> Optional[Decimal]:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _row_to_catalog_item(row: Sequence[Any], columns: Sequence[str]) -> Dict[str, Any]:
+    mapping = {name.upper(): row[idx] for idx, name in enumerate(columns)}
+    result: Dict[str, Any] = {
+        "id": None,
+        "code": None,
+        "barcode": None,
+        "name": None,
+        "uom": None,
+        "price": None,
+        "vat": None,
+    }
+    if "ITEM_ID" in mapping:
+        try:
+            result["id"] = int(mapping["ITEM_ID"])
+        except Exception:
+            result["id"] = None
+    if "ITEM_CODE" in mapping:
+        result["code"] = _clean_string(mapping["ITEM_CODE"])
+    if "ITEM_BARCODE" in mapping:
+        result["barcode"] = _clean_string(mapping["ITEM_BARCODE"])
+    if "ITEM_NAME" in mapping:
+        result["name"] = _clean_string(mapping["ITEM_NAME"])
+    if "ITEM_UOM" in mapping:
+        result["uom"] = _clean_string(mapping["ITEM_UOM"])
+    if "ITEM_PRICE" in mapping:
+        result["price"] = _decimal_or_none(mapping["ITEM_PRICE"])
+    if "ITEM_VAT" in mapping:
+        vat_value = _decimal_or_none(mapping["ITEM_VAT"])
+        result["vat"] = vat_value
+    return result
+
+
+def _catalog_select_clause(schema: Dict[str, str | None], include_barcode: bool = True) -> Tuple[str, List[str]]:
+    parts: List[str] = []
+    aliases: List[str] = []
+
+    def _add(expr: str, alias: str) -> None:
+        parts.append(f"{expr} AS {alias}")
+        aliases.append(alias)
+
+    def _expr(column: Optional[str], alias: str, table_alias: str = "M") -> None:
+        if column:
+            _add(f"{table_alias}.{column}", alias)
+        else:
+            _add("NULL", alias)
+
+    _expr(schema.get("materials_id"), "ITEM_ID")
+    _expr(schema.get("materials_code"), "ITEM_CODE")
+    if include_barcode:
+        if schema.get("barcode_col"):
+            _expr(schema.get("barcode_col"), "ITEM_BARCODE", table_alias="B")
+        else:
+            _add("NULL", "ITEM_BARCODE")
+    _expr(schema.get("materials_name"), "ITEM_NAME")
+    _expr(schema.get("materials_uom"), "ITEM_UOM")
+    _expr(schema.get("materials_price"), "ITEM_PRICE")
+    _expr(schema.get("materials_vat"), "ITEM_VAT")
+    return ", ".join(parts), aliases
+
+
+def get_item_by_barcode(cur: Any, barcode: str) -> Optional[Dict[str, Any]]:
+    """Търси артикул по баркод."""
+
+    value = (barcode or "").strip()
+    if not value:
+        return None
+
+    active_cur = _require_cursor(cur=cur)
+    schema = detect_catalog_schema(active_cur)
+    barcode_table = schema.get("barcode_table")
+    barcode_col = schema.get("barcode_col")
+    barcode_fk = schema.get("barcode_mat_fk")
+    materials_table = schema.get("materials_table")
+    materials_id = schema.get("materials_id")
+    if not (barcode_table and barcode_col and barcode_fk and materials_table and materials_id):
+        return None
+
+    select_clause, aliases = _catalog_select_clause(schema, include_barcode=True)
+    sql = (
+        f"SELECT FIRST 1 {select_clause} "
+        f"FROM {barcode_table} B "
+        f"JOIN {materials_table} M ON B.{barcode_fk} = M.{materials_id} "
+        f"WHERE TRIM(B.{barcode_col}) = TRIM(?)"
+    )
+    active_cur.execute(sql, (value,))
+    row = active_cur.fetchone()
+    if not row:
+        return None
+    description = [desc[0].strip().upper() for desc in active_cur.description]
+    return _row_to_catalog_item(row, description or aliases)
+
+
+def get_item_by_code(cur: Any, code: str) -> Optional[Dict[str, Any]]:
+    """Търси артикул по вътрешен код."""
+
+    value = (code or "").strip()
+    if not value:
+        return None
+
+    active_cur = _require_cursor(cur=cur)
+    schema = detect_catalog_schema(active_cur)
+    materials_table = schema.get("materials_table")
+    materials_code = schema.get("materials_code")
+    materials_id = schema.get("materials_id")
+    if not (materials_table and materials_code):
+        return None
+
+    select_clause, aliases = _catalog_select_clause(schema, include_barcode=bool(schema.get("barcode_table")))
+    join_clause = ""
+    if schema.get("barcode_table") and schema.get("barcode_col") and schema.get("barcode_mat_fk") and materials_id:
+        join_clause = (
+            f" LEFT JOIN {schema['barcode_table']} B ON B.{schema['barcode_mat_fk']} = M.{materials_id}"
+        )
+
+    sql = (
+        f"SELECT FIRST 1 {select_clause} "
+        f"FROM {materials_table} M"
+        f"{join_clause} "
+        f"WHERE UPPER(TRIM(M.{materials_code})) = UPPER(TRIM(?))"
+    )
+    active_cur.execute(sql, (value,))
+    row = active_cur.fetchone()
+    if not row:
+        return None
+    description = [desc[0].strip().upper() for desc in active_cur.description]
+    return _row_to_catalog_item(row, description or aliases)
+
+
+def find_item_candidates_by_name(cur: Any, name: str, limit: int = 3) -> List[Dict[str, Any]]:
+    """Намира кандидати по подобие на име."""
+
+    normalized = " ".join((name or "").split())
+    if not normalized:
+        return []
+
+    active_cur = _require_cursor(cur=cur)
+    schema = detect_catalog_schema(active_cur)
+    materials_table = schema.get("materials_table")
+    name_col = schema.get("materials_name")
+    materials_id = schema.get("materials_id")
+    if not (materials_table and name_col):
+        return []
+
+    try:
+        safe_limit = max(1, int(limit))
+    except (TypeError, ValueError):
+        safe_limit = 3
+
+    select_clause, aliases = _catalog_select_clause(schema, include_barcode=bool(schema.get("barcode_table")))
+    join_clause = ""
+    if schema.get("barcode_table") and schema.get("barcode_col") and schema.get("barcode_mat_fk") and materials_id:
+        join_clause = (
+            f" LEFT JOIN {schema['barcode_table']} B ON B.{schema['barcode_mat_fk']} = M.{materials_id}"
+        )
+
+    pattern = f"%{_escape_like(normalized)}%"
+    sql = (
+        f"SELECT DISTINCT FIRST {safe_limit} {select_clause} "
+        f"FROM {materials_table} M"
+        f"{join_clause} "
+        f"WHERE UPPER(TRIM(M.{name_col})) LIKE UPPER(?) ESCAPE '\\' "
+        f"ORDER BY CHAR_LENGTH(TRIM(M.{name_col}))"
+    )
+    active_cur.execute(sql, (pattern,))
+    rows = active_cur.fetchall() or []
+    if not rows:
+        return []
+    description = [desc[0].strip().upper() for desc in active_cur.description]
+    return [_row_to_catalog_item(row, description or aliases) for row in rows]
+
+
+def _enrich_catalog_result(data: Dict[str, Any], match: str) -> Dict[str, Any]:
+    payload = dict(data)
+    payload["source"] = "db"
+    payload["match"] = match
+    return payload
+
+
 def _hash_with_algo(plain: str, salt: Optional[str], algo: str) -> str:
     data = plain if salt in (None, "") else f"{plain}{salt}"
     raw = data.encode("utf-8")
@@ -712,10 +1155,23 @@ def detect_login_method(cur: Any | None = None) -> Dict[str, Any]:
         )
         return table_meta
 
-    logger.error("Не е открит механизъм за логин (профил: %s).", profile_label)
-    raise UnsupportedAuthSchema(
-        "Не успях да открия механизъм за логин. Нужна е допълнителна конфигурация."
+    fallback_meta = {
+        "mode": "table",
+        "name": "USERS",
+        "sp_kind": None,
+        "fields": {
+            "id": "ID",
+            "login": "NAME",
+            "password": "PASS",
+            "has_name": True,
+            "has_pass": True,
+        },
+    }
+    _log_warning(
+        "Не открих специфична login таблица – използвам USERS по подразбиране.",
+        profile=profile_label,
     )
+    return fallback_meta
 
 
 def login_user(username: str, password: str) -> Tuple[int, str]:
@@ -1150,132 +1606,18 @@ def get_item_info(code_or_name: str) -> Optional[Dict[str, Any]]:
     if not value:
         return None
 
-    base_select = (
-        "SELECT m.ID, m.MATERIALCODE, m.UNIQUECODE, m.MATERIAL, m.SEARCHNAME, "
-        "m.LASTDELIVERYPRICE, m.AVGDELIVERYPRICE, m.LASTDELIVERYPRICEWOTAX, "
-        "m.AVGDELIVERYPRICEWOTAX, m.QTY, m.TAXGROUPID, b.CODE AS BARCODE, tg.TAXPERCENTAGE "
-        "FROM MATERIAL m "
-        "LEFT JOIN BARCODE b ON b.STORAGEMATERIALCODE = m.MATERIALCODE AND b.LOCATIONID = m.LOCATIONID "
-        "LEFT JOIN TAXGROUP tg ON tg.ID = m.TAXGROUPID "
-    )
+    item = get_item_by_code(cur, value)
+    if item:
+        return item
 
-    def _row_to_dict(row: Tuple[Any, ...], columns: Sequence[str]) -> Dict[str, Any]:
-        data = dict(zip(columns, row))
-        price = Decimal(str(data.get("LASTDELIVERYPRICE") or 0))
-        price_wo_vat = Decimal(str(data.get("LASTDELIVERYPRICEWOTAX") or 0))
-        vat = data.get("TAXPERCENTAGE")
-        return {
-            "id": int(data["ID"]),
-            "code": int(data["MATERIALCODE"]),
-            "unique_code": int(data.get("UNIQUECODE") or 0),
-            "name": (data.get("MATERIAL") or data.get("SEARCHNAME") or "").strip(),
-            "barcode": (data.get("BARCODE") or "").strip() or None,
-            "price": price,
-            "price_no_vat": price_wo_vat,
-            "avg_price": Decimal(str(data.get("AVGDELIVERYPRICE") or 0)),
-            "vat": Decimal(str(vat or 0)),
-            "qty": Decimal(str(data.get("QTY") or 0)),
-            "tax_group_id": data.get("TAXGROUPID"),
-        }
+    item = get_item_by_barcode(cur, value)
+    if item:
+        return item
 
-    def _query(where: str, params: Sequence[Any]) -> Optional[Dict[str, Any]]:
-        sql = base_select + where
-        cur.execute(sql, params)
-        row = cur.fetchone()
-        if not row:
-            return None
-        columns = [desc[0].strip().upper() for desc in cur.description]
-        return _row_to_dict(row, columns)
-
-    # 1) точен match по материален код
-    if value.isdigit():
-        result = _query("WHERE m.MATERIALCODE = ?", (int(value),))
-        if result:
-            return result
-
-    # 2) точен match по баркод
-    result = _query("WHERE b.CODE = ?", (value,))
-    if result:
-        return result
-
-    # 3) fallback по LIKE име
-    like_param = f"%{value.upper()}%"
-    result = _query("WHERE UPPER(m.MATERIAL) LIKE ? ORDER BY m.MATERIALCODE", (like_param,))
-    return result
-
-
-def _material_primary_name(cur: Any, material_id: Any, fallback: Optional[str] = None) -> str:
-    """Връща предпочитаното име за материал."""
-    if fallback:
-        fallback = str(fallback).strip()
-        if fallback:
-            return fallback
-    try:
-        cur.execute(
-            "SELECT FIRST 1 mn.NAME FROM MATERIALNAME mn "
-            "WHERE mn.MATERIAL = ? ORDER BY mn.ISDEFAULT DESC, mn.ID",
-            (material_id,),
-        )
-        row = cur.fetchone()
-    except Exception:
-        row = None
-    if not row:
-        return fallback or ""
-    value = row[0] if isinstance(row, (list, tuple)) else row
-    return (str(value).strip()) if value is not None else (fallback or "")
-
-
-def _collect_candidates(
-    cur: Any,
-    rows: Sequence[Sequence[Any]],
-    column_names: Sequence[str],
-    source: str,
-) -> List[Dict[str, Any]]:
-    """Помощен метод за изграждане на резултатите от заявките."""
-    results: List[Dict[str, Any]] = []
-    upper_columns = [name.strip().upper() for name in column_names]
-    column_map = {name: idx for idx, name in enumerate(upper_columns)}
-    for row in rows:
-        if row is None:
-            continue
-        material_id = None
-        code_value: Any = None
-        name_value: Any = None
-        barcode_value: Any = None
-        if "MATERIAL" in column_map:
-            material_id = row[column_map["MATERIAL"]]
-        if "ID" in column_map and material_id is None:
-            material_id = row[column_map["ID"]]
-        if "CODE" in column_map:
-            code_value = row[column_map["CODE"]]
-        if "MATERIALCODE" in column_map and code_value is None:
-            code_value = row[column_map["MATERIALCODE"]]
-        if "BARCODE" in column_map:
-            barcode_value = row[column_map["BARCODE"]]
-        if "NAME" in column_map:
-            name_value = row[column_map["NAME"]]
-        if "MATERIAL" in column_map and name_value is None:
-            name_value = row[column_map["MATERIAL"]]
-
-        clean_code = (str(code_value).strip() if code_value is not None else "")
-        clean_name = _material_primary_name(cur, material_id, name_value)
-        clean_barcode = (
-            str(barcode_value).strip()
-            if barcode_value is not None and str(barcode_value).strip()
-            else None
-        )
-
-        results.append(
-            {
-                "id": int(material_id) if material_id not in (None, "") else None,
-                "code": clean_code or None,
-                "name": clean_name,
-                "barcode": clean_barcode,
-                "source": "db",
-                "match": source,
-            }
-        )
-    return results
+    candidates = find_item_candidates_by_name(cur, value, limit=1)
+    if candidates:
+        return candidates[0]
+    return None
 
 
 def db_find_by_barcode(cur: Any, barcode: str) -> List[Dict[str, Any]]:
@@ -1285,26 +1627,12 @@ def db_find_by_barcode(cur: Any, barcode: str) -> List[Dict[str, Any]]:
     if not normalized:
         return []
 
-    active_cur = _require_cursor(cur=cur)
-    sql = (
-        "SELECT b.MATERIAL, b.BARCODE, m.CODE, mn.NAME "
-        "FROM BARCODE b "
-        "JOIN MATERIAL m ON m.ID = b.MATERIAL "
-        "LEFT JOIN MATERIALNAME mn ON mn.MATERIAL = m.ID AND mn.ISDEFAULT = 1 "
-        "WHERE b.BARCODE = ?"
-    )
-    active_cur.execute(sql, (normalized,))
-    rows = active_cur.fetchall() or []
-    if not rows:
+    item = get_item_by_barcode(cur, normalized)
+    if not item:
         return []
-    column_names = [desc[0] for desc in active_cur.description]
-    results = _collect_candidates(active_cur, rows, column_names, "barcode")
-    logger.info(
-        "DB resolve: barcode match → %s кандидата за %s",
-        len(results),
-        normalized,
-    )
-    return results
+    result = [_enrich_catalog_result(item, "barcode")]
+    logger.info("DB resolve: barcode match → %s кандидата за %s", len(result), normalized)
+    return result
 
 
 def db_find_by_code(cur: Any, code: str) -> List[Dict[str, Any]]:
@@ -1314,25 +1642,12 @@ def db_find_by_code(cur: Any, code: str) -> List[Dict[str, Any]]:
     if not normalized:
         return []
 
-    active_cur = _require_cursor(cur=cur)
-    sql = (
-        "SELECT m.ID, m.CODE, mn.NAME "
-        "FROM MATERIAL m "
-        "LEFT JOIN MATERIALNAME mn ON mn.MATERIAL = m.ID AND mn.ISDEFAULT = 1 "
-        "WHERE m.CODE = ?"
-    )
-    active_cur.execute(sql, (normalized,))
-    rows = active_cur.fetchall() or []
-    if not rows:
+    item = get_item_by_code(cur, normalized)
+    if not item:
         return []
-    column_names = [desc[0] for desc in active_cur.description]
-    results = _collect_candidates(active_cur, rows, column_names, "code")
-    logger.info(
-        "DB resolve: code match → %s кандидата за %s",
-        len(results),
-        normalized,
-    )
-    return results
+    result = [_enrich_catalog_result(item, "code")]
+    logger.info("DB resolve: code match → %s кандидата за %s", len(result), normalized)
+    return result
 
 
 def _escape_like(value: str) -> str:
@@ -1346,25 +1661,8 @@ def db_find_by_name_like(cur: Any, name: str, limit: int = 5) -> List[Dict[str, 
     if not normalized:
         return []
 
-    active_cur = _require_cursor(cur=cur)
-    pattern = f"%{_escape_like(normalized)}%"
-    try:
-        safe_limit = int(limit)
-    except (TypeError, ValueError):
-        safe_limit = 5
-    safe_limit = max(1, safe_limit)
-    sql = (
-        f"SELECT FIRST {safe_limit} m.ID, m.CODE, mn.NAME "
-        "FROM MATERIAL m "
-        "JOIN MATERIALNAME mn ON mn.MATERIAL = m.ID "
-        "WHERE UPPER(mn.NAME) LIKE UPPER(?) ESCAPE '\\'"
-    )
-    active_cur.execute(sql, (pattern,))
-    rows = active_cur.fetchall() or []
-    if not rows:
-        return []
-    column_names = [desc[0] for desc in active_cur.description]
-    results = _collect_candidates(active_cur, rows, column_names, "name")
+    candidates = find_item_candidates_by_name(cur, normalized, limit=limit)
+    results = [_enrich_catalog_result(candidate, "name") for candidate in candidates]
     logger.info(
         "DB resolve: name LIKE → %s кандидата за %s",
         len(results),
