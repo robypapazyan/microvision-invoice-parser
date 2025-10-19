@@ -250,7 +250,14 @@ def _collect_table_login_candidates() -> List[Dict[str, Any]]:
                 login_col = upper_map[candidate]
                 break
         has_name = login_col is not None
-        has_pass = "PASS" in upper_map
+        pass_field = upper_map.get("PASS")
+        hash_field = None
+        for candidate in ("PASS_HASH", "PASSWORD_HASH", "PWD_HASH", "PAROLA_HASH"):
+            if candidate in upper_map:
+                hash_field = upper_map[candidate]
+                break
+
+        has_pass = pass_field is not None or hash_field is not None
         if not has_pass:
             continue
         id_col = None
@@ -272,10 +279,12 @@ def _collect_table_login_candidates() -> List[Dict[str, Any]]:
             "fields": {
                 "id": id_col,
                 "login": login_col,
-                "password": upper_map["PASS"],
+                "password": pass_field,
+                "password_hash": hash_field,
                 "salt": salt_col,
                 "has_name": has_name,
                 "has_pass": has_pass,
+                "has_hash": hash_field is not None,
             },
             "columns": cols,
         }
@@ -553,6 +562,7 @@ def connect(profile: Dict[str, Any]) -> Tuple[Any, Any]:
     user = profile.get("user", "SYSDBA")
     password = profile.get("password", "masterkey")
     charset = profile.get("charset", "WIN1251") or "WIN1251"
+    charset = str(charset).upper()
 
     profile_label = str(
         profile.get("label")
@@ -562,8 +572,14 @@ def connect(profile: Dict[str, Any]) -> Tuple[Any, Any]:
         or database
     )
 
-    logger.info(
-        f"Свързване към база (профил: {profile_label}, host={host}, database={database}, driver={_FB_API})."
+    _log_info(
+        "Свързване към база",
+        profile=profile_label,
+        host=host,
+        port=port,
+        database=database,
+        driver=_FB_API,
+        charset=charset,
     )
     try:
         conn = _connect_raw(host, port, database, user, password, charset)
@@ -585,7 +601,7 @@ def connect(profile: Dict[str, Any]) -> Tuple[Any, Any]:
     _DELIVERY_GENERATORS = None
     _TABLE_COLUMNS.clear()
     _DELIVERY_CONTEXT.clear()
-    logger.info("Свързването е успешно (профил: %s).", profile_label)
+    _log_info("Свързването е успешно", profile=profile_label, driver=_FB_API, charset=charset)
     return conn, cur
 
 
@@ -601,7 +617,10 @@ def detect_login_method(cur: Any | None = None) -> Dict[str, Any]:
         SELECT TRIM(p.rdb$procedure_name), COALESCE(p.rdb$procedure_type, 2)
         FROM rdb$procedures p
         WHERE (p.rdb$system_flag IS NULL OR p.rdb$system_flag = 0)
-          AND UPPER(p.rdb$procedure_name) LIKE '%LOGIN%'
+          AND (
+            UPPER(p.rdb$procedure_name) LIKE '%LOGIN%'
+            OR UPPER(p.rdb$procedure_name) LIKE '%USER%'
+          )
         ORDER BY 1
         """
     )
@@ -671,7 +690,11 @@ def detect_login_method(cur: Any | None = None) -> Dict[str, Any]:
             fallback_meta = _prepare_table_meta(table_candidates_cache or [])
             if fallback_meta:
                 meta["fallback_table"] = fallback_meta
-            logger.info(f"Открита login процедура: {name} ({sp_kind}).")
+            _log_info(
+                "Открита login процедура",
+                procedure=name,
+                sp_kind=sp_kind,
+            )
             return meta
 
     if table_candidates_cache is None:
@@ -680,11 +703,11 @@ def detect_login_method(cur: Any | None = None) -> Dict[str, Any]:
     if table_meta:
         has_name = "да" if table_meta["fields"].get("has_name") else "не"
         has_pass = "да" if table_meta["fields"].get("has_pass") else "не"
-        logger.info(
-            "Открит login чрез таблица: %s (NAME=%s, PASS=%s).",
-            table_meta["name"],
-            has_name,
-            has_pass,
+        _log_info(
+            "Открит login чрез таблица",
+            table=table_meta["name"],
+            has_login=has_name,
+            has_pass=has_pass,
         )
         return table_meta
 
@@ -843,38 +866,84 @@ def _is_no_result_set_error(exc: Exception) -> bool:
 
 
 def _extract_operator_from_row(
-    row: Sequence[Any], outputs: List[Dict[str, Any]], username: str
-) -> Tuple[int, str]:
+    row: Sequence[Any],
+    outputs: List[Dict[str, Any]],
+    username: str,
+    description: Optional[Sequence[Sequence[Any]]] = None,
+) -> Optional[Tuple[int, str]]:
     operator_id: Optional[int] = None
     operator_login: Optional[str] = None
-    sequence = list(row)
-    for idx, field in enumerate(outputs):
-        value = sequence[idx] if idx < len(sequence) else None
+
+    def _coerce_int(value: Any) -> Optional[int]:
         if value is None:
-            continue
-        if operator_id is None and isinstance(value, (int, float)):
+            return None
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int,)):
+            return int(value)
+        if isinstance(value, float):
             try:
-                operator_id = int(value)
-                continue
+                return int(value)
             except (TypeError, ValueError):
-                pass
-        name = (field.get("name") or "").upper()
-        if operator_login is None and name and any(token in name for token in ("LOGIN", "USER", "CODE")):
-            operator_login = str(value).strip()
-    if operator_id is None and sequence:
+                return None
         try:
-            operator_id = int(sequence[0])
-        except (TypeError, ValueError) as exc:
-            raise MistralDBError(
-                "Процедурата за логин не върна идентификатор. Нужна е доработка."
-            ) from exc
-    if operator_login is None and len(sequence) > 1:
-        operator_login = str(sequence[1]).strip() if sequence[1] is not None else None
+            text = str(value).strip()
+        except Exception:
+            return None
+        if not text:
+            return None
+        if text.isdigit():
+            try:
+                return int(text)
+            except ValueError:
+                return None
+        return None
+
+    names_from_description: List[str] = []
+    if description:
+        for col in description:
+            if not col:
+                continue
+            raw_name = col[0] if isinstance(col, (list, tuple)) else None
+            if raw_name:
+                names_from_description.append(str(raw_name).strip().upper())
+
+    tokens_for_id = ("OP", "USER", "OPER", "ID")
+    tokens_for_login = ("LOGIN", "USER", "NAME", "CODE")
+
+    for idx, value in enumerate(row):
+        name_candidate = ""
+        if idx < len(outputs):
+            name_candidate = str(outputs[idx].get("name") or "").strip().upper()
+        if not name_candidate and idx < len(names_from_description):
+            name_candidate = names_from_description[idx]
+
+        coerced = _coerce_int(value)
+        if operator_id is None and name_candidate:
+            if any(token in name_candidate for token in tokens_for_id) and coerced is not None:
+                operator_id = coerced
+        if operator_login is None and name_candidate:
+            if any(token in name_candidate for token in tokens_for_login):
+                try:
+                    operator_login = str(value).strip()
+                except Exception:
+                    operator_login = None
+
+    if operator_id is None and row:
+        operator_id = _coerce_int(row[0])
+
     if operator_login is None:
-        operator_login = username or (str(operator_id) if operator_id is not None else "")
+        if len(row) > 1 and row[1] not in (None, ""):
+            operator_login = str(row[1]).strip()
+        elif operator_id is not None:
+            operator_login = str(operator_id)
+        else:
+            operator_login = username or ""
+
     if operator_id is None:
-        raise MistralDBError("Невалиден потребител или парола")
-    return operator_id, operator_login
+        return None
+
+    return operator_id, operator_login or (username or str(operator_id))
 
 
 def _login_via_procedure(
@@ -898,6 +967,7 @@ def _login_via_procedure(
         _log_info("Login чрез процедура (SELECT)", procedure=name)
         try:
             cur.execute(sql, args)
+            description = getattr(cur, "description", None)
             rows = cur.fetchall()
         except _FB_ERROR as exc:
             if _is_no_result_set_error(exc):
@@ -910,8 +980,15 @@ def _login_via_procedure(
         else:
             if rows:
                 row = rows[0]
-                operator_id, operator_login = _extract_operator_from_row(row, outputs, username)
-                return operator_id, operator_login
+                result = _extract_operator_from_row(row, outputs, username, description)
+                if result is not None:
+                    operator_id, operator_login = result
+                    return operator_id, operator_login
+                _trace("sp_missing_identifier", procedure=name, mode="select")
+                _log_warning(
+                    "Процедурата не върна идентификатор – преминаваме към таблица",
+                    procedure=name,
+                )
             _trace("sp_no_result", procedure=name, mode="select")
 
     exec_sql = (
@@ -922,6 +999,7 @@ def _login_via_procedure(
     row: Optional[Sequence[Any]] = None
     try:
         cur.execute(exec_sql, args)
+        description = getattr(cur, "description", None)
         try:
             row = cur.fetchone()
         except _FB_ERROR as exc:
@@ -938,7 +1016,16 @@ def _login_via_procedure(
         _trace("sp_no_result", procedure=name, mode="execute")
         return None
 
-    operator_id, operator_login = _extract_operator_from_row(row, outputs, username)
+    result = _extract_operator_from_row(row, outputs, username, description)
+    if result is None:
+        _trace("sp_missing_identifier", procedure=name, mode="execute")
+        _log_warning(
+            "Процедурата не върна идентификатор – преминаваме към таблица",
+            procedure=name,
+        )
+        return None
+
+    operator_id, operator_login = result
     return operator_id, operator_login
 
 
@@ -952,20 +1039,41 @@ def _login_via_users_table(
     fields = (meta or {}).get("fields") or {}
     id_field = fields.get("id") or "ID"
     login_field = fields.get("login") or "NAME"
-    pass_field = fields.get("password") or "PASS"
+    pass_field = fields.get("password")
+    hash_field = fields.get("password_hash")
 
     username_clean = username.strip()
     password_value = password
     mode = "username" if username_clean else "password"
 
-    clauses = [f"TRIM({pass_field}) = ?"]
-    params: List[Any] = [password_value]
+    if not pass_field and hash_field and not password_value:
+        raise MistralDBError("Не е въведена парола.")
+
+    if not pass_field and hash_field:
+        _trace(
+            "table_hash_detected",
+            table=table,
+            hash_column=hash_field,
+        )
+        _log_warning(
+            "Налична е колона за хеширани пароли – TODO реализация",
+            table=table,
+            hash_column=hash_field,
+        )
+        raise MistralDBError(
+            "Този профил използва хеширани пароли – свържете се с поддръжка."
+        )
+
+    effective_pass_field = pass_field or hash_field or "PASS"
+
+    clauses = [f"TRIM({effective_pass_field}) = TRIM(?)"]
+    params: List[Any] = [password_value.strip() if isinstance(password_value, str) else password_value]
     if username_clean:
-        clauses.insert(0, f"UPPER({login_field}) = UPPER(?)")
+        clauses.insert(0, f"UPPER(TRIM({login_field})) = UPPER(TRIM(?))")
         params.insert(0, username_clean)
 
     query_sql = (
-        f"SELECT {id_field}, {login_field}, {pass_field} FROM {table} WHERE "
+        f"SELECT {id_field}, {login_field}, {effective_pass_field} FROM {table} WHERE "
         + " AND ".join(clauses)
     )
     debug_params = (
@@ -1010,7 +1118,8 @@ def _login_via_users_table(
 
     row = rows[0]
     stored_pass = "" if row[2] is None else str(row[2]).strip()
-    if username_clean and stored_pass != password_value:
+    password_comp = password_value.strip() if isinstance(password_value, str) else password_value
+    if username_clean and stored_pass != (password_comp if password_comp is not None else ""):
         _trace(
             "table_no_match",
             table=table,
@@ -1145,11 +1254,18 @@ def create_open_delivery(operator_id: int) -> int:
     column_names = list(values.keys())
     placeholders = ", ".join(["?"] * len(column_names))
     sql = f"INSERT INTO {header_table} ({', '.join(column_names)}) VALUES ({placeholders})"
-    try:
-        with _transaction():
-            conn.cursor().execute(sql, [values[col] for col in column_names])
-    except _FB_ERROR as exc:
-        raise MistralDBError(f"Неуспешно създаване на OPEN доставка: {exc}") from exc
+    if os.getenv("MV_ENABLE_OPEN_DELIVERY", "").strip() == "1":
+        try:
+            with _transaction():
+                conn.cursor().execute(sql, [values[col] for col in column_names])
+        except _FB_ERROR as exc:
+            raise MistralDBError(f"Неуспешно създаване на OPEN доставка: {exc}") from exc
+    else:
+        _log_info(
+            "OPEN доставка не е записана (скелет режим)",
+            table=header_table,
+            delivery_id=delivery_id,
+        )
 
     _DELIVERY_CONTEXT[delivery_id] = {"nomer": values.get("NOMER"), "header_table": header_table}
     return delivery_id
@@ -1200,6 +1316,14 @@ def push_items_to_mistral(delivery_id: int, items: List[Dict[str, Any]]) -> None
     sale_price_vat_col = _find_col("SALESPRICEDDS")
     sum_sale_col = _find_col("SUMASALESPRICE")
     sum_sale_vat_col = _find_col("SUMASALESPRICEDDS")
+
+    if os.getenv("MV_ENABLE_OPEN_DELIVERY", "").strip() != "1":
+        _log_info(
+            "Артикулите не са записани (скелет режим)",
+            table=detail_table,
+            items=len(items),
+        )
+        return
 
     try:
         with _transaction():

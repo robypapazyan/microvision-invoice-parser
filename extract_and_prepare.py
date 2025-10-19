@@ -89,7 +89,7 @@ FUZZY_MATCH_CUTOFF = 0.3 # Праг за близост на съвпадени�
 # OCR support
 try:
     from pdf2image import convert_from_path
-    from PIL import Image, ImageFilter, ImageOps
+    from PIL import Image, ImageEnhance, ImageFilter, ImageOps
     import pytesseract
     # Ако потребителят не е задал пътя до Tesseract, може да се наложи да го укажете тук:
     # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe' # Пример за Windows
@@ -98,6 +98,8 @@ try:
 except ImportError:
     PYTESSERACT_AVAILABLE = False
     print("WARN: OCR библиотеките (pytesseract, pdf2image, Pillow) не са инсталирани. Обработката на сканирани PDF/JPEG няма да работи.")
+
+OSD_ROTATE_RE = re.compile(r"Rotate:\s*(\d+)")
 
 # PDF support
 try:
@@ -109,82 +111,103 @@ except ImportError:
 
 # --- Функции ---
 
+def _apply_exif_orientation(image):
+    try:
+        return ImageOps.exif_transpose(image)
+    except Exception:
+        return image
+
+
+def _deskew_image(image):
+    if not PYTESSERACT_AVAILABLE:
+        return image
+    try:
+        osd_output = pytesseract.image_to_osd(image, config="--psm 0")
+    except Exception:
+        return image
+    match = OSD_ROTATE_RE.search(osd_output or "")
+    if not match:
+        return image
+    try:
+        angle = int(match.group(1))
+    except (ValueError, TypeError):
+        return image
+    angle = angle % 360
+    if angle in (0, 360):
+        return image
+    try:
+        return image.rotate(-angle, expand=True)
+    except Exception:
+        return image
+
+
 def preprocess_image(image):
     """Подготвя изображение за OCR."""
     try:
-        image = image.convert('L') # Черно-бяло
-        # image = ImageOps.invert(image) # Инвертиране (понякога помага)
-        image = image.filter(ImageFilter.MedianFilter(size=3)) # Намаляване на шум
-        image = ImageOps.autocontrast(image, cutoff=5) # Автоконтраст
-        # image = image.point(lambda x: 0 if x < 140 else 255, '1') # Binarization threshold
-        return image
+        working = _apply_exif_orientation(image)
+        working = working.convert("L")
+        working = ImageOps.autocontrast(working, cutoff=4)
+        working = working.filter(ImageFilter.MedianFilter(size=3))
+        working = _deskew_image(working)
+        enhancer = ImageEnhance.Contrast(working)
+        working = enhancer.enhance(1.4)
+        threshold = working.point(lambda x: 0 if x < 135 else 255)
+        return threshold
     except Exception as e:
         print(f"WARN: Грешка при препроцесинг на изображение: {e}")
-        return image # Върни оригиналното при грешка
+        return image  # Върни оригиналното при грешка
 
 def extract_text_from_pdf(pdf_path):
     """Комбинирано извличане: PyPDF2 + OCR fallback"""
+    def has_meaningful_text(text: str) -> bool:
+        cleaned = text.strip()
+        if len(cleaned) < 40:
+            return False
+        letters = sum(1 for ch in cleaned if ch.isalpha())
+        ratio = letters / len(cleaned)
+        return ratio > 0.2
+
     text_pypdf2 = ""
-    success_pypdf2 = False
-    try:
-        reader = PdfReader(pdf_path)
-        text_pypdf2 = "\n".join(page.extract_text() or "" for page in reader.pages)
-        print(f"INFO: Първоначално извлечен текст с PyPDF2: {len(text_pypdf2)} символа.")
-        # --- ДОБАВИ ТОЗИ РЕД ЗА ДЕБЪГ ---
-        print(f"DEBUG_PYPDF2_RAW_TEXT_START:\n---\n{text_pypdf2[:1500]}\n---\nDEBUG_PYPDF2_RAW_TEXT_END") # Печатаме първите 1500 символа
-        # ---------------------------------
-        if text_pypdf2 and text_pypdf2.strip() and len(text_pypdf2.strip()) > 50: # Проверка дали има смислен текст
-             # Допълнителна проверка за "маймуница" - брой на не-ASCII и не-кирилски символи
-             non_standard_chars = 0
-             for char_code in [ord(c) for c in text_pypdf2.strip()]:
-                 # Позволени: ASCII (32-126), Кирилица (1024-1279), някои препинателни знаци
-                 if not (32 <= char_code <= 126 or 1024 <= char_code <= 1279 or char_code in [10, 13, 8211, 8212, 8216, 8217, 8220, 8221, 8226, 8364, 8470]):
-                     non_standard_chars += 1
+    if PYPDF2_AVAILABLE:
+        try:
+            reader = PdfReader(pdf_path)
+            text_pypdf2 = "\n".join((page.extract_text() or "") for page in reader.pages)
+            print(f"INFO: PyPDF2 извлече {len(text_pypdf2)} символа.")
+        except Exception as exc:
+            print(f"ERROR: Грешка при четене на PDF с PyPDF2: {exc}")
+            text_pypdf2 = ""
 
-             percentage_non_standard = (non_standard_chars / len(text_pypdf2.strip())) * 100 if len(text_pypdf2.strip()) > 0 else 0
-             print(f"DEBUG_PYPDF2: Процент не-стандартни символи: {percentage_non_standard:.2f}%")
-
-             if percentage_non_standard < 30: # Ако под 30% от символите са странни, приемаме текста
-                 print("INFO: Текстът от PyPDF2 изглежда приемлив.")
-                 success_pypdf2 = True
-             else:
-                 print("WARN: Текстът от PyPDF2 съдържа твърде много не-стандартни символи.")
-
-    except Exception as e:
-        print(f"ERROR: Грешка при четене на PDF с PyPDF2: {e}")
-        text_pypdf2 = "" # Нулирай, ако има грешка
-
-    if success_pypdf2:
+    if text_pypdf2 and has_meaningful_text(text_pypdf2):
         return text_pypdf2
-    else: # Ако PyPDF2 не е успял или текстът е лош
-        print("⚠️ PyPDF2 не успя или текстът е неразбираем/лош. Превключвам към OCR (ако е наличен)...")
-        if PYTESSERACT_AVAILABLE:
-            try:
-                images = convert_from_path(pdf_path, dpi=300) # Опитай и с dpi=200 или dpi=400
-                ocr_text_parts = []
-                for i, img in enumerate(images):
-                    print(f"INFO: OCR обработка на страница {i+1}/{len(images)}...")
-                    # Опитай различни PSM режими, ако стандартният не работи добре
-                    # psm_modes = [3, 6, 11, 12, 4] # 3 е Auto, 6 е Uniform block, 11 е Sparse text, 12 е sparse text with osd, 4 е single column
-                    # for psm_mode in psm_modes:
-                    # print(f"  DEBUG_OCR: Опитвам PSM режим: {psm_mode}")
-                    # custom_config = rf'-l bul+eng --oem 3 --psm {psm_mode}'
-                    custom_config = r'-l bul+eng --oem 3 --psm 6' # Връщаме стандартния
-                    part_text = pytesseract.image_to_string(preprocess_image(img.copy()), config=custom_config)
-                    ocr_text_parts.append(part_text)
 
-                ocr_text = "\n".join(ocr_text_parts)
-                print(f"INFO: Извлечен текст чрез OCR: {len(ocr_text)} символа.")
-                # --- ДОБАВИ ТОЗИ РЕД ЗА ДЕБЪГ НА OCR ---
-                print(f"DEBUG_OCR_RAW_TEXT_START:\n---\n{ocr_text[:1500]}\n---\nDEBUG_OCR_RAW_TEXT_END")
-                # ---------------------------------------
-                return ocr_text
-            except Exception as ocr_error:
-                print(f"ERROR: Грешка при OCR: {ocr_error}")
-                return "" # Върни празен стринг, ако и OCR се провали
-        else:
-            print("ERROR: OCR функционалност не е налична, а PyPDF2 не успя.")
-            return "" # Върни празен стринг
+    print("⚠️ PyPDF2 не върна достатъчно текст. Активирам OCR fallback…")
+    if not PYTESSERACT_AVAILABLE:
+        print("ERROR: OCR функционалност не е налична.")
+        return text_pypdf2
+
+    try:
+        images = convert_from_path(pdf_path, dpi=300)
+    except Exception as exc:
+        print(f"ERROR: Неуспешно конвертиране на PDF в изображения: {exc}")
+        return text_pypdf2
+
+    ocr_text_parts = []
+    for index, image in enumerate(images, start=1):
+        print(f"INFO: OCR обработка на страница {index}/{len(images)}…")
+        processed = preprocess_image(image)
+        try:
+            part = pytesseract.image_to_string(
+                processed,
+                config=r"-l bul+eng --oem 3 --psm 6",
+            )
+        except Exception as exc:
+            print(f"WARN: OCR грешка на страница {index}: {exc}")
+            part = ""
+        ocr_text_parts.append(part)
+
+    ocr_text = "\n".join(ocr_text_parts)
+    print(f"INFO: OCR извлече {len(ocr_text)} символа.")
+    return ocr_text or text_pypdf2
 
 def ocr_image(image_obj):
     """Извлича текст от PIL Image обект с OCR."""
@@ -218,16 +241,11 @@ def extract_text_with_ocr(file_path):
     text = ""
     try:
         if file_path.lower().endswith('.pdf'):
-            print("INFO: Опит за OCR на PDF файл...")
-            images = convert_from_path(file_path, dpi=300) # DPI може да се регулира
-            print(f"INFO: PDF конвертиран в {len(images)} изображения за OCR.")
-            for i, img in enumerate(images):
-                print(f"INFO: OCR обработка на страница {i+1}/{len(images)}...")
-                text += ocr_image(img) + '\n'
-        elif file_path.lower().endswith(('.jpg', '.jpeg', '.png', '.tiff', '.bmp')):
-             print(f"INFO: Опит за OCR на изображение ({os.path.basename(file_path)})...")
-             img = Image.open(file_path)
-             text = ocr_image(img)
+            return extract_text_from_pdf(file_path)
+        if file_path.lower().endswith(('.jpg', '.jpeg', '.png', '.tiff', '.bmp')):
+            print(f"INFO: OCR на изображение ({os.path.basename(file_path)})…")
+            with Image.open(file_path) as img:
+                text = ocr_image(img)
         else:
             print(f"WARN: Неподдържан файлов тип за OCR: {file_path}")
             return ""
@@ -555,11 +573,7 @@ def main(input_path=None, gui_mode=False):
     file_ext = os.path.splitext(input_path)[1].lower()
 
     if file_ext == '.pdf':
-        # Първо се опитваме с директно извличане на текст (ако PDF не е сканиран)
         text = extract_text_from_pdf(input_path)
-        if not text.strip():
-            print("INFO: PDF изглежда като сканиран – преминавам към OCR...")
-            text = extract_text_with_ocr(input_path)
 
     elif file_ext in ('.jpg', '.jpeg', '.png', '.tiff', '.bmp'):
         if PYTESSERACT_AVAILABLE:
