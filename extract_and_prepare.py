@@ -654,7 +654,8 @@ def main(input_path=None, gui_mode=False):
                         'qty': extract_quantity(line),      # Извличаме количеството ВИНАГИ
                         'purchase_price': row_data['Последна покупна цена'], # От базата
                         'selling_price': row_data['Продажна цена'], # От базата
-                        'barcode': row_data['Баркод'] # От базата
+                        'barcode': row_data['Баркод'], # От базата
+                        'token': line,
                     }
                     print(f"  ✅ Намерено в mapping чрез СЪВПАДЕНИЕ НА ДУМИ: '{key}' -> {item_data['code']} / {item_data['name']}")
                     export_items.append(item_data)
@@ -729,7 +730,8 @@ def main(input_path=None, gui_mode=False):
                         'qty': extract_quantity(line),
                         'purchase_price': matched_row['Последна покупна цена'], # От базата
                         'selling_price': matched_row['Продажна цена'], # От базата
-                        'barcode': matched_row['Баркод'] # От базата
+                        'barcode': matched_row['Баркод'], # От базата
+                        'token': line,
                     } # <--- УВЕРИ СЕ, ЧЕ ТАЗИ СКОБА Е ТУК!
                     export_items.append(item_data)
                     save_new_mapping(line, matched_row['Номер'])  # <-- този ред добави ТУК
@@ -754,7 +756,8 @@ def main(input_path=None, gui_mode=False):
                             'qty': extract_quantity(line),
                             'purchase_price': row_data['Последна покупна цена'], # От базата
                             'selling_price': row_data['Продажна цена'], # От базата
-                            'barcode': row_data['Баркод'] # От базата
+                            'barcode': row_data['Баркод'], # От базата
+                            'token': line,
                         } # <--- УВЕРИ СЕ, ЧЕ И ТУК ИМА СКОБА!
                         export_items.append(item_data)
                          # Добавяне към mapping с ИМЕТО ОТ БАЗАТА като ключ
@@ -801,7 +804,8 @@ def main(input_path=None, gui_mode=False):
                         'qty': extract_quantity(line),
                         'purchase_price': row_data['Последна покупна цена'], # От базата
                         'selling_price': row_data['Продажна цена'], # От базата
-                        'barcode': row_data['Баркод'] # От базата
+                        'barcode': row_data['Баркод'], # От базата
+                        'token': line,
                     }     # <--- УВЕРИ СЕ, ЧЕ И ТУК ИМА СКОБА!
                     export_items.append(item_data)
                     # Добавяне към mapping с ИМЕТО ОТ БАЗАТА като ключ
@@ -846,6 +850,8 @@ def main(input_path=None, gui_mode=False):
     print(f"Артикули добавени в експортния файл: {len(export_items)}")
     print("--- Край ---")
 # Край на функцията main() - тук свършва отместването навътре за main
+
+    return export_items
 
 
 # --- Стартиране --- (Този блок е ИЗВЪН main(), без отместване)

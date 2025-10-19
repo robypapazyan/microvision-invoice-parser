@@ -10,6 +10,7 @@ from decimal import Decimal, ROUND_HALF_UP
 # logging handlers are imported lazily in the configuration helper
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+import re
 
 try:  # pragma: no cover - loguru е предпочитан, но не задължителен
     from loguru import logger as _loguru_logger
@@ -1201,6 +1202,204 @@ def get_item_info(code_or_name: str) -> Optional[Dict[str, Any]]:
     like_param = f"%{value.upper()}%"
     result = _query("WHERE UPPER(m.MATERIAL) LIKE ? ORDER BY m.MATERIALCODE", (like_param,))
     return result
+
+
+def _material_primary_name(cur: Any, material_id: Any, fallback: Optional[str] = None) -> str:
+    """Връща предпочитаното име за материал."""
+    if fallback:
+        fallback = str(fallback).strip()
+        if fallback:
+            return fallback
+    try:
+        cur.execute(
+            "SELECT FIRST 1 mn.NAME FROM MATERIALNAME mn "
+            "WHERE mn.MATERIAL = ? ORDER BY mn.ISDEFAULT DESC, mn.ID",
+            (material_id,),
+        )
+        row = cur.fetchone()
+    except Exception:
+        row = None
+    if not row:
+        return fallback or ""
+    value = row[0] if isinstance(row, (list, tuple)) else row
+    return (str(value).strip()) if value is not None else (fallback or "")
+
+
+def _collect_candidates(
+    cur: Any,
+    rows: Sequence[Sequence[Any]],
+    column_names: Sequence[str],
+    source: str,
+) -> List[Dict[str, Any]]:
+    """Помощен метод за изграждане на резултатите от заявките."""
+    results: List[Dict[str, Any]] = []
+    upper_columns = [name.strip().upper() for name in column_names]
+    column_map = {name: idx for idx, name in enumerate(upper_columns)}
+    for row in rows:
+        if row is None:
+            continue
+        material_id = None
+        code_value: Any = None
+        name_value: Any = None
+        barcode_value: Any = None
+        if "MATERIAL" in column_map:
+            material_id = row[column_map["MATERIAL"]]
+        if "ID" in column_map and material_id is None:
+            material_id = row[column_map["ID"]]
+        if "CODE" in column_map:
+            code_value = row[column_map["CODE"]]
+        if "MATERIALCODE" in column_map and code_value is None:
+            code_value = row[column_map["MATERIALCODE"]]
+        if "BARCODE" in column_map:
+            barcode_value = row[column_map["BARCODE"]]
+        if "NAME" in column_map:
+            name_value = row[column_map["NAME"]]
+        if "MATERIAL" in column_map and name_value is None:
+            name_value = row[column_map["MATERIAL"]]
+
+        clean_code = (str(code_value).strip() if code_value is not None else "")
+        clean_name = _material_primary_name(cur, material_id, name_value)
+        clean_barcode = (
+            str(barcode_value).strip()
+            if barcode_value is not None and str(barcode_value).strip()
+            else None
+        )
+
+        results.append(
+            {
+                "id": int(material_id) if material_id not in (None, "") else None,
+                "code": clean_code or None,
+                "name": clean_name,
+                "barcode": clean_barcode,
+                "source": "db",
+                "match": source,
+            }
+        )
+    return results
+
+
+def db_find_by_barcode(cur: Any, barcode: str) -> List[Dict[str, Any]]:
+    """Връща списък кандидати по точен баркод."""
+
+    normalized = (barcode or "").strip()
+    if not normalized:
+        return []
+
+    active_cur = _require_cursor(cur=cur)
+    sql = (
+        "SELECT b.MATERIAL, b.BARCODE, m.CODE, mn.NAME "
+        "FROM BARCODE b "
+        "JOIN MATERIAL m ON m.ID = b.MATERIAL "
+        "LEFT JOIN MATERIALNAME mn ON mn.MATERIAL = m.ID AND mn.ISDEFAULT = 1 "
+        "WHERE b.BARCODE = ?"
+    )
+    active_cur.execute(sql, (normalized,))
+    rows = active_cur.fetchall() or []
+    if not rows:
+        return []
+    column_names = [desc[0] for desc in active_cur.description]
+    results = _collect_candidates(active_cur, rows, column_names, "barcode")
+    logger.info(
+        "DB resolve: barcode match → %s кандидата за %s",
+        len(results),
+        normalized,
+    )
+    return results
+
+
+def db_find_by_code(cur: Any, code: str) -> List[Dict[str, Any]]:
+    """Точно съвпадение по вътрешен код/артикулен номер."""
+
+    normalized = (code or "").strip()
+    if not normalized:
+        return []
+
+    active_cur = _require_cursor(cur=cur)
+    sql = (
+        "SELECT m.ID, m.CODE, mn.NAME "
+        "FROM MATERIAL m "
+        "LEFT JOIN MATERIALNAME mn ON mn.MATERIAL = m.ID AND mn.ISDEFAULT = 1 "
+        "WHERE m.CODE = ?"
+    )
+    active_cur.execute(sql, (normalized,))
+    rows = active_cur.fetchall() or []
+    if not rows:
+        return []
+    column_names = [desc[0] for desc in active_cur.description]
+    results = _collect_candidates(active_cur, rows, column_names, "code")
+    logger.info(
+        "DB resolve: code match → %s кандидата за %s",
+        len(results),
+        normalized,
+    )
+    return results
+
+
+def _escape_like(value: str) -> str:
+    return re.sub(r"([%_\\])", r"\\\\\1", value)
+
+
+def db_find_by_name_like(cur: Any, name: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """LIKE търсене по име (case-insensitive)."""
+
+    normalized = " ".join((name or "").split())
+    if not normalized:
+        return []
+
+    active_cur = _require_cursor(cur=cur)
+    pattern = f"%{_escape_like(normalized)}%"
+    try:
+        safe_limit = int(limit)
+    except (TypeError, ValueError):
+        safe_limit = 5
+    safe_limit = max(1, safe_limit)
+    sql = (
+        f"SELECT FIRST {safe_limit} m.ID, m.CODE, mn.NAME "
+        "FROM MATERIAL m "
+        "JOIN MATERIALNAME mn ON mn.MATERIAL = m.ID "
+        "WHERE UPPER(mn.NAME) LIKE UPPER(?) ESCAPE '\\'"
+    )
+    active_cur.execute(sql, (pattern,))
+    rows = active_cur.fetchall() or []
+    if not rows:
+        return []
+    column_names = [desc[0] for desc in active_cur.description]
+    results = _collect_candidates(active_cur, rows, column_names, "name")
+    logger.info(
+        "DB resolve: name LIKE → %s кандидата за %s",
+        len(results),
+        normalized,
+    )
+    return results
+
+
+def db_resolve_item(cur: Any, token: str) -> List[Dict[str, Any]]:
+    """Централен резолвер за артикули."""
+
+    normalized = " ".join((token or "").split())
+    if not normalized:
+        logger.debug("DB resolve: празен токен")
+        return []
+
+    active_cur = _require_cursor(cur=cur)
+    barcode_candidates = db_find_by_barcode(active_cur, normalized)
+    if barcode_candidates:
+        return barcode_candidates
+
+    code_candidates = db_find_by_code(active_cur, normalized)
+    if code_candidates:
+        return code_candidates
+
+    try:
+        limit_env = int(os.getenv("MV_DB_NAME_LIKE_LIMIT", "5") or "5")
+    except ValueError:
+        limit_env = 5
+    name_candidates = db_find_by_name_like(active_cur, normalized, limit=limit_env)
+    if name_candidates:
+        return name_candidates
+
+    logger.info("DB resolve: no match за '%s'", normalized)
+    return []
 
 
 def create_open_delivery(operator_id: int) -> int:
