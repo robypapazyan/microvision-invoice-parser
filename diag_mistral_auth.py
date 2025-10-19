@@ -110,68 +110,8 @@ def print_meta(meta: Dict[str, Any]) -> None:
 
 
 def print_trace(trace: List[Dict[str, Any]]) -> None:
-    if not trace:
-        print("\nНяма налична хронология от опита за логин.")
-        return
-
-    print("\nХронология на опита:")
-    for step in trace:
-        action = step.get("action")
-        ts = step.get("timestamp")
-        prefix = f"[{ts}] " if ts else ""
-        if action == "start":
-            print(
-                f"- {prefix}Старт: профил {step.get('profile')} | потребител: {step.get('username')}"
-            )
-        elif action == "detected_mode":
-            print(
-                f"- {prefix}Открит режим: {step.get('mode')} ({step.get('name')})"
-            )
-        elif action == "procedure_attempt":
-            mode = step.get("mode")
-            params = step.get("params", {})
-            print(
-                f"- {prefix}Процедура ({mode}): {step.get('procedure')} | SQL: {step.get('sql')}"
-            )
-            print(
-                f"    параметри: потребител={params.get('username')} парола={params.get('password')}"
-            )
-        elif action == "procedure_switch":
-            print(
-                f"- {prefix}Превключване от {step.get('from')} към {step.get('to')} (причина: {step.get('reason')})"
-            )
-        elif action == "procedure_error":
-            print(
-                f"- {prefix}Грешка при процедура ({step.get('mode')}): {step.get('procedure')} -> {step.get('error')}"
-            )
-        elif action == "procedure_result":
-            print(
-                f"- {prefix}Резултат процедура ({step.get('mode')}): {step.get('procedure')} | редове: {step.get('rows')}"
-            )
-        elif action == "procedure_callproc":
-            print(f"- {prefix}Опит за callproc: {step.get('procedure')}")
-        elif action == "procedure_fallback_table":
-            print(
-                f"- {prefix}Fallback към таблица: {step.get('procedure')} -> {step.get('table')}"
-            )
-        elif action == "table_attempt":
-            params = step.get("params", {})
-            print(
-                f"- {prefix}Таблица ({step.get('mode')}): {step.get('table')} | SQL: {step.get('sql')}"
-            )
-            print(
-                f"    параметри: потребител={params.get('username')} парола={params.get('password')}"
-            )
-        elif action == "table_error":
-            print(f"- {prefix}Грешка при таблица {step.get('table')}: {step.get('error')}")
-        elif action == "table_result":
-            print(f"- {prefix}Резултат от таблица {step.get('table')}: {step.get('rows')} ред(а)")
-        elif action == "success":
-            print(
-                f"- {prefix}Успех: оператор ID={step.get('operator_id')} login={step.get('operator_login')}"
-            )
-        elif action == "failure":
-            print(f"- {prefix}Неуспех: {step.get('message')}")
+    print("TRACE:")
+    print(json.dumps(trace, ensure_ascii=False, indent=2))
         
 
 def main() -> None:
@@ -216,31 +156,38 @@ def main() -> None:
     else:
         print("\nТестов вход без потребителско име (само парола)")
 
-    result_text = ""
     success = False
+    error_message = ""
+    operator_id: int | None = None
+    operator_login = ""
     try:
         operator_id, operator_login = login_user(args.user or "", args.password or "")
     except MistralDBError as exc:
-        result_text = f"Краен резултат: НЕВАЛИДЕН – {exc}"
+        error_message = str(exc)
     else:
-        result_text = (
-            "Краен резултат: УСПЕХ – "
-            f"оператор ID={operator_id}, потребител={operator_login}"
-        )
         success = True
-    finally:
-        trace = get_last_login_trace()
-        print_trace(trace)
-        try:
-            cur.close()
-        except Exception:  # pragma: no cover - защитно
-            pass
-        try:
-            conn.close()
-        except Exception:  # pragma: no cover - защитно
-            pass
 
-    print("\n" + result_text)
+    trace = get_last_login_trace()
+
+    if success:
+        print(
+            "LOGIN RESULT: SUCCESS "
+            f"(operator_id={operator_id}, operator_login={operator_login})"
+        )
+    else:
+        print(f"LOGIN RESULT: FAILURE ({error_message or 'неуспешен вход'})")
+
+    print_trace(trace)
+
+    try:
+        cur.close()
+    except Exception:  # pragma: no cover - защитно
+        pass
+    try:
+        conn.close()
+    except Exception:  # pragma: no cover - защитно
+        pass
+
     sys.exit(0 if success else 1)
 
 

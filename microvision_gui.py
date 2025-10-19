@@ -9,6 +9,7 @@ import hashlib
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime
+from importlib import import_module
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -16,8 +17,6 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import db_integration
-import extract_and_prepare
-
 from mistral_db import get_last_login_trace, logger
 
 try:  # legacy fallback
@@ -248,58 +247,6 @@ class MicroVisionApp:
         except Exception:  # pragma: no cover - защитно
             pass
 
-    def _format_login_trace(self, trace: List[Dict[str, Any]]) -> List[str]:
-        lines: List[str] = []
-        for step in trace:
-            action = step.get("action")
-            ts = step.get("timestamp")
-            prefix = f"[{ts}] " if ts else ""
-            if action == "start":
-                lines.append(
-                    f"{prefix}Старт – профил {step.get('profile')} | потребител: {step.get('username')}"
-                )
-            elif action == "detected_mode":
-                lines.append(
-                    f"{prefix}Открит режим: {step.get('mode')} ({step.get('name')})"
-                )
-            elif action == "procedure_attempt":
-                lines.append(
-                    f"{prefix}Процедура ({step.get('mode')}): {step.get('procedure')}"
-                )
-            elif action == "procedure_result":
-                lines.append(f"{prefix}Процедура – редове: {step.get('rows')}")
-            elif action == "procedure_error":
-                lines.append(f"{prefix}Грешка при процедура: {step.get('error')}")
-            elif action == "procedure_switch":
-                lines.append(
-                    f"{prefix}Превключване от {step.get('from')} към {step.get('to')}"
-                )
-            elif action == "procedure_callproc":
-                lines.append(f"{prefix}Опит за callproc: {step.get('procedure')}")
-            elif action == "procedure_fallback_table":
-                lines.append(
-                    f"{prefix}Fallback към таблица: {step.get('procedure')} → {step.get('table')}"
-                )
-            elif action == "table_attempt":
-                lines.append(
-                    f"{prefix}Таблица ({step.get('mode')}): {step.get('table')}"
-                )
-            elif action == "table_result":
-                lines.append(f"{prefix}Таблица – редове: {step.get('rows')}")
-            elif action == "table_error":
-                lines.append(f"{prefix}Грешка при таблица: {step.get('error')}")
-            elif action == "success":
-                lines.append(
-                    f"{prefix}Успех – оператор ID {step.get('operator_id')} ({step.get('operator_login')})"
-                )
-            elif action == "failure":
-                lines.append(f"{prefix}Неуспех – {step.get('message')}")
-            else:
-                lines.append(f"{prefix}{action}: {step}")
-        if not lines:
-            lines.append("Няма налични данни за диагностика.")
-        return lines
-
     def _show_login_diagnostics(self) -> None:
         trace = get_last_login_trace() or self.last_login_trace
         if not trace:
@@ -327,8 +274,10 @@ class MicroVisionApp:
         text.configure(yscrollcommand=scrollbar.set)
         text.configure(font="TkFixedFont")
 
-        lines = self._format_login_trace(trace)
-        text.insert("1.0", "\n".join(lines))
+        trace_json = json.dumps(trace, ensure_ascii=False, indent=2)
+        if not trace_json.strip():
+            trace_json = "[]"
+        text.insert("1.0", trace_json)
         text.configure(state="disabled")
 
         ttk.Button(dialog, text="Затвори", command=dialog.destroy).pack(pady=(4, 0))
@@ -491,9 +440,20 @@ class MicroVisionApp:
         self._log(f"🔄 Обработка на файл: {file_path}")
 
         try:
-            rows = extract_and_prepare.main(file_path, gui_mode=True)  # type: ignore[arg-type]
+            extractor = import_module("extract_and_prepare")
+        except Exception as exc:
+            self._report_error("Липсва модулът за обработка на документи.", exc)
+            return
+
+        main_fn = getattr(extractor, "main", None)
+        if not callable(main_fn):
+            self._log("⚠️ Модулът extract_and_prepare няма функция main.")
+            return
+
+        try:
+            rows = main_fn(file_path, gui_mode=True)  # type: ignore[arg-type]
         except TypeError:
-            rows = extract_and_prepare.main(file_path)
+            rows = main_fn(file_path)  # type: ignore[arg-type]
         except Exception as exc:
             self._report_error("Възникна грешка при обработката на файла.", exc)
             return
@@ -570,28 +530,95 @@ class MicroVisionApp:
 
     def _refresh_license_text(self) -> None:
         license_file = Path(__file__).with_name("license.json")
+        validator = None
+        try:
+            from license_utils import validate_license as _validate_license  # type: ignore
+
+            validator = _validate_license
+        except ImportError:
+            validator = None
+        except Exception as exc:  # pragma: no cover - защитно
+            logger.warning("Неуспешно зареждане на license_utils: %s", exc)
+            validator = None
+
+        if validator is not None:
+            try:
+                try:
+                    validation_result = validator(str(license_file))
+                except TypeError:
+                    validation_result = validator()
+            except Exception as exc:
+                logger.exception("Грешка при validate_license: %s", exc)
+                self.license_var.set("Лиценз: проверка недостъпна")
+                return
+
+            days_remaining: Optional[int] = None
+            valid_flag: Optional[bool] = None
+
+            if isinstance(validation_result, dict):
+                for key in ("days_remaining", "remaining_days", "days_left"):
+                    if key in validation_result:
+                        try:
+                            days_remaining = int(validation_result[key])
+                        except (TypeError, ValueError):
+                            days_remaining = None
+                        break
+                valid_flag = validation_result.get("valid")
+            elif isinstance(validation_result, (tuple, list)):
+                for item in validation_result:
+                    if isinstance(item, (int, float)):
+                        days_remaining = int(item)
+                    elif isinstance(item, bool) and valid_flag is None:
+                        valid_flag = item
+            elif isinstance(validation_result, (int, float)):
+                days_remaining = int(validation_result)
+            elif isinstance(validation_result, bool):
+                valid_flag = validation_result
+
+            if days_remaining is not None:
+                if days_remaining < 0:
+                    self.license_var.set("Лиценз: изтекъл")
+                else:
+                    self.license_var.set(f"Лиценз: оставащи {days_remaining} дни")
+                return
+            if valid_flag is True:
+                self.license_var.set("Лиценз: оставащи ? дни")
+                return
+            if valid_flag is False:
+                self.license_var.set("Лиценз: изтекъл")
+                return
+            logger.warning("validate_license върна неочаквани данни: %r", validation_result)
+
         if not license_file.exists():
             self.license_var.set("Лиценз: проверка недостъпна")
             logger.warning("Лиценз файлът липсва: %s", license_file)
             return
+
         try:
             with license_file.open("r", encoding="utf-8") as fh:
                 data = json.load(fh)
-            valid_until = data.get("valid_until")
-            if not valid_until:
-                raise ValueError("Липсва поле valid_until")
-            expiry = datetime.fromisoformat(str(valid_until)).date()
-            today = datetime.now().date()
-            remaining = (expiry - today).days
-            if remaining < 0:
-                self.license_var.set("Лиценз: изтекъл")
-            else:
-                self.license_var.set(f"Лиценз: оставащи {remaining} дни")
-        except FileNotFoundError:
-            self.license_var.set("Лиценз: проверка недостъпна")
         except Exception as exc:
-            logger.exception("Грешка при проверка на лиценза: %s", exc)
+            logger.exception("Грешка при прочитане на лиценз файла: %s", exc)
             self.license_var.set("Лиценз: проверка недостъпна")
+            return
+
+        valid_until = data.get("valid_until")
+        if not valid_until:
+            self.license_var.set("Лиценз: проверка недостъпна")
+            return
+
+        try:
+            expiry = datetime.fromisoformat(str(valid_until)).date()
+        except ValueError:
+            self.license_var.set("Лиценз: проверка недостъпна")
+            return
+
+        today = datetime.now().date()
+        remaining = (expiry - today).days
+        if remaining < 0:
+            self.license_var.set("Лиценз: изтекъл")
+        else:
+            self.license_var.set(f"Лиценз: оставащи {remaining} дни")
 
 
 # -------------------------
