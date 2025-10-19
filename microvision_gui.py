@@ -7,7 +7,7 @@ import os
 import sys
 import hashlib
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from importlib import import_module
 from pathlib import Path
@@ -93,6 +93,7 @@ class SessionState:
     password: str = ""
     ui_root: Any = None
     output_logger: Optional[Callable[[str], None]] = None
+    unresolved_items: List[Dict[str, Any]] = field(default_factory=list)
 
 
 
@@ -233,7 +234,7 @@ class MicroVisionApp:
         self.rows_cache: List[Dict[str, Any]] = []
         self.last_login_trace: List[Dict[str, Any]] = []
         self.status_summary_var = tk.StringVar(
-            value="Редове: 0 | намерени в БД: 0 | чрез mapping: 0 | неразрешени: 0"
+            value="Намерени в БД: 0 | чрез mapping: 0 | нерешени: 0"
         )
 
         self._build_ui()
@@ -380,22 +381,10 @@ class MicroVisionApp:
             return
 
         username = self.username_var.get().strip() or self.session.username
-        password = self.password_var.get() or getattr(self.session, "password", "")
+        stored_password = getattr(self.session, "password", "")
+        password = stored_password or self.password_var.get() or ""
         if not password:
-            try:
-                from tkinter import simpledialog
-
-                password = simpledialog.askstring(
-                    "Диагностика",
-                    "Въведете паролата за тест на входа:",
-                    show="•",
-                    parent=self.root,
-                ) or ""
-            except Exception:
-                password = ""
-        if not password:
-            self._log("⚠️ Диагностиката е отменена – липсва парола.")
-            return
+            self._log("ℹ️ Диагностиката ще използва празна парола.")
 
         script_path = Path(__file__).with_name("diag_mistral_auth.py")
         if not script_path.exists():
@@ -452,6 +441,23 @@ class MicroVisionApp:
             try:
                 diag_info = diag_fn(self.session)
                 diag_lines: List[str] = []
+                status_text = diag_info.get("status")
+                if status_text:
+                    diag_lines.append(f"Статус: {status_text}")
+
+                login_info = diag_info.get("login") or {}
+                if isinstance(login_info, dict):
+                    mode = login_info.get("mode")
+                    name = login_info.get("name") or login_info.get("table")
+                    if mode == "sp":
+                        diag_lines.append(
+                            f"Логин: процедура {name or '—'} ({login_info.get('sp_kind') or 'неизвестна'})"
+                        )
+                    elif mode == "table":
+                        diag_lines.append(f"Логин: таблица {name or '—'}")
+                if diag_info.get("login_error"):
+                    diag_lines.append(f"Логин: грешка ({diag_info['login_error']})")
+
                 schema_info = diag_info.get("schema") or {}
                 if isinstance(schema_info, dict) and schema_info.get("materials_table"):
                     diag_lines.append(
@@ -482,29 +488,32 @@ class MicroVisionApp:
                 elif diag_info.get("barcode_error"):
                     diag_lines.append(f"Баркодове: грешка ({diag_info['barcode_error']})")
 
-                sample_barcode = diag_info.get("sample_barcode")
-                sample_barcode_matches = diag_info.get("sample_barcode_matches") or []
-                if sample_barcode and sample_barcode_matches:
-                    match = sample_barcode_matches[0]
-                    diag_lines.append(
-                        f"Пример баркод {sample_barcode} → {match.get('code') or '—'} | {match.get('name') or 'без име'}"
-                    )
+                samples_payload = diag_info.get("samples") or {}
+                if isinstance(samples_payload, dict):
+                    barcode_payload = samples_payload.get("barcode") or {}
+                    if barcode_payload.get("value"):
+                        material = barcode_payload.get("material") or {}
+                        diag_lines.append(
+                            "Пример баркод {0} → {1} | {2}".format(
+                                barcode_payload.get("value"),
+                                material.get("code") or "—",
+                                material.get("name") or "без име",
+                            )
+                        )
+                    name_payload = samples_payload.get("name") or {}
+                    if name_payload.get("value"):
+                        candidates = name_payload.get("candidates") or []
+                        first_candidate = candidates[0] if candidates else {}
+                        diag_lines.append(
+                            "Пример име '{0}' → {1}".format(
+                                name_payload.get("value"),
+                                first_candidate.get("code") or "—",
+                            )
+                        )
 
-                sample_code = diag_info.get("sample_code")
-                sample_code_matches = diag_info.get("sample_code_matches") or []
-                if sample_code and sample_code_matches:
-                    match = sample_code_matches[0]
-                    diag_lines.append(
-                        f"Пример код {sample_code} → {match.get('name') or 'без име'}"
-                    )
-
-                sample_name = diag_info.get("sample_name")
-                sample_name_matches = diag_info.get("sample_name_matches") or []
-                if sample_name and sample_name_matches:
-                    first_name = sample_name_matches[0]
-                    diag_lines.append(
-                        f"Пример име '{sample_name}' → {first_name.get('code') or '—'}"
-                    )
+                errors_list = diag_info.get("errors") or []
+                for error_item in errors_list:
+                    diag_lines.append(f"⚠️ {error_item}")
 
                 summary_lines.append("--- DB диагностика ---")
                 summary_lines.extend(diag_lines or ["Няма налични данни за диагностика на БД."])
@@ -555,6 +564,7 @@ class MicroVisionApp:
         self.session.raw_login_payload = None
         self.session.last_login_trace = None
         self.session.password = ""
+        self.session.unresolved_items = []
         self.last_login_trace = []
         self.username_var.set("")
         self.password_var.set("")
@@ -721,6 +731,22 @@ class MicroVisionApp:
         resolver = getattr(db_integration, "resolve_items_from_db", None)
         if callable(resolver):
             rows = resolver(self.session, rows)
+            unresolved = getattr(self.session, "unresolved_items", [])
+            if unresolved:
+                preview = ", ".join(
+                    filter(
+                        None,
+                        [
+                            (entry.get("token") or entry.get("name") or entry.get("barcode") or "?")
+                            for entry in unresolved[:3]
+                            if isinstance(entry, dict)
+                        ],
+                    )
+                )
+                suffix = f" ({preview})" if preview else ""
+                self._log(
+                    f"📝 Нерешени редове за последваща обработка: {len(unresolved)}{suffix}"
+                )
         else:
             self._log("⚠️ Липсва DB резолвер – използвам суровите редове.")
 
@@ -751,7 +777,6 @@ class MicroVisionApp:
             self._log("⚠️ Няма потвърдени артикули за експорт/доставка.")
 
     def _update_status_summary(self, rows: List[Dict[str, Any]]) -> None:
-        total = len(rows)
         db_count = 0
         mapping_count = 0
         for row in rows:
@@ -761,10 +786,9 @@ class MicroVisionApp:
                 db_count += 1
             elif source == "mapping":
                 mapping_count += 1
-        unresolved = total - db_count - mapping_count
+        unresolved = max(len(rows) - db_count - mapping_count, 0)
         summary = (
-            f"Редове: {total} | намерени в БД: {db_count} | "
-            f"чрез mapping: {mapping_count} | неразрешени: {max(unresolved, 0)}"
+            f"Намерени в БД: {db_count} | чрез mapping: {mapping_count} | нерешени: {unresolved}"
         )
         self.status_summary_var.set(summary)
 

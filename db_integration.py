@@ -10,18 +10,21 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from mistral_db import (  # type: ignore[attr-defined]
     MistralDBError,
+    Material,
+    _require_cursor,
     connect,
     create_open_delivery,
     detect_catalog_schema,
-    get_items_by_name,
+    detect_login_method,
+    find_material_candidates,
     get_item_by_barcode,
     get_item_by_code,
+    get_items_by_name,
     get_last_login_trace,
-    resolve_item,
+    get_material_by_barcode,
     logger,
     login_user,
     push_items_to_mistral,
-    _require_cursor,
 )
 
 
@@ -380,6 +383,18 @@ def _choose_candidate_dialog(
     return result.get("value")
 
 
+def _material_to_candidate(material: Material, match: str) -> Dict[str, Any]:
+    return {
+        "id": None,
+        "code": material.code,
+        "name": material.name,
+        "barcode": material.barcode,
+        "storage_code": material.storage_code,
+        "source": "db",
+        "match": match,
+    }
+
+
 def resolve_items_from_db(session: Any, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not rows:
         return []
@@ -398,80 +413,83 @@ def resolve_items_from_db(session: Any, rows: List[Dict[str, Any]]) -> List[Dict
         try:
             detect_catalog_schema(cur)
         except MistralDBError as exc:
-            logger.warning("Неуспешно откриване на каталожната схема: %s", exc)
+            logger.warning("Каталогът не може да бъде детектиран: %s", exc)
+            cur = None
+            use_db = False
+
+    unresolved_entries: List[Dict[str, Any]] = []
     resolved_rows: List[Dict[str, Any]] = []
+
     for row in rows:
         working = dict(row)
-        token = _extract_token_from_row(working)
+        barcode = _first_nonempty(row, ("barcode", "Баркод", "EAN", "ean", "Barcode"))
+        code = _first_nonempty(row, ("code", "Номер", "Артикул", "item_code", "internal_code"))
+        name = _first_nonempty(
+            row,
+            (
+                "name",
+                "description",
+                "product",
+                "Име",
+                "Описание",
+                "Детайл",
+                "item_name",
+                "Наименование",
+            ),
+        )
+        token = _extract_token_from_row(row)
         working.setdefault("token", token)
-        working.pop("resolved", None)
-        working.pop("final_item", None)
+        working["resolved"] = None
+        working["final_item"] = None
 
-        candidates: List[Dict[str, Any]] = []
-        attempted_tokens: List[str] = []
-        matched_token: Optional[str] = None
+        candidate: Optional[Dict[str, Any]] = None
+        multi_candidates: List[Dict[str, Any]] = []
 
-        if use_db and cur is not None:
-            search_tokens: List[str] = []
-            if barcode:
-                search_tokens.append(str(barcode))
-            if code:
-                search_tokens.append(str(code))
-            if name:
-                search_tokens.append(str(name))
-            if token:
-                search_tokens.append(str(token))
+        if use_db and cur is not None and barcode:
+            try:
+                material = get_material_by_barcode(cur, str(barcode))
+            except MistralDBError as exc:
+                logger.error("Грешка при търсене на баркод '%s': %s", barcode, exc)
+            else:
+                if material:
+                    candidate = _material_to_candidate(material, "barcode")
 
-            seen_tokens: set[str] = set()
-            for raw_token in search_tokens:
-                clean_token = " ".join(str(raw_token).split())
-                if not clean_token:
-                    continue
-                token_key = clean_token.lower()
-                if token_key in seen_tokens:
-                    continue
-                seen_tokens.add(token_key)
-                attempted_tokens.append(clean_token)
-                try:
-                    db_candidates = resolve_item(cur, clean_token)
-                except MistralDBError as exc:
-                    logger.error("Грешка при търсене в базата: %s", exc)
-                    candidates = []
-                    break
-                if db_candidates:
-                    candidates = [
-                        dict(candidate, source=candidate.get("source", "db"))
-                        for candidate in db_candidates
-                    ]
-                    matched_token = clean_token
-                    break
+        if use_db and cur is not None and candidate is None and name:
+            try:
+                materials = find_material_candidates(cur, str(name))
+            except MistralDBError as exc:
+                logger.error("Грешка при търсене по име '%s': %s", name, exc)
+                materials = []
+            if len(materials) == 1:
+                candidate = _material_to_candidate(materials[0], "name")
+            elif len(materials) > 1:
+                multi_candidates = [
+                    _material_to_candidate(material, "name") for material in materials
+                ]
 
-        if len(candidates) == 1:
-            candidate = candidates[0]
+        if candidate:
             apply_candidate_choice(working, candidate, candidate.get("source", "db"))
             stats["db"] += 1
             logger.info(
-                "DB resolve: еднозначно съвпадение → token=%s → код=%s",
-                matched_token or token,
+                "DB resolve: съвпадение (%s) → код=%s",
+                candidate.get("match"),
                 working["final_item"].get("code"),
             )
-        elif len(candidates) > 1:
-            working["resolved"] = {"candidates": candidates}
+        elif multi_candidates:
+            working["resolved"] = {"candidates": multi_candidates, "token": name}
             stats["multi"] += 1
             logger.info(
-                "DB resolve: multiple (%s) → need user decision",
-                len(candidates),
+                "DB resolve: %s кандидата по име → изисква се избор",
+                len(multi_candidates),
             )
         else:
-            if use_db and attempted_tokens:
-                joined = ", ".join(f"„{value}“" for value in attempted_tokens)
-                message = f"⚠️ БД: не е намерен артикул за {joined}."
-                logger.warning("DB resolve: няма намерен артикул за %s", joined)
-                _log_to_output(session, message)
-
             fallback_candidate = _fallback_match(working, token)
             if fallback_candidate:
-                apply_candidate_choice(working, fallback_candidate, fallback_candidate.get("source", "mapping"))
+                apply_candidate_choice(
+                    working,
+                    fallback_candidate,
+                    fallback_candidate.get("source", "mapping"),
+                )
                 stats["mapping"] += 1
                 logger.info(
                     "DB resolve: fallback mapping → token=%s → код=%s",
@@ -482,11 +500,30 @@ def resolve_items_from_db(session: Any, rows: List[Dict[str, Any]]) -> List[Dict
                 working["resolved"] = None
                 working["final_item"] = None
                 stats["unresolved"] += 1
-                logger.info("DB resolve: no match → unresolved → token=%s", token)
+                message = token or name or code or barcode or "(без стойност)"
+                logger.info("DB resolve: no match → unresolved → token=%s", message)
+                unresolved_entries.append(
+                    {
+                        "token": token or "",
+                        "barcode": barcode,
+                        "code": code,
+                        "name": name,
+                    }
+                )
+                if use_db and (barcode or name):
+                    joined = " | ".join(
+                        filter(None, [str(barcode or ""), str(name or ""), str(code or "")])
+                    )
+                    if joined:
+                        _log_to_output(
+                            session,
+                            f"⚠️ БД: не е намерен артикул за „{joined}“.",
+                        )
 
         resolved_rows.append(working)
 
     session.last_resolution_stats = stats
+    session.unresolved_items = unresolved_entries
     return resolved_rows
 
 
@@ -494,15 +531,25 @@ def collect_db_diagnostics(session: Any) -> Dict[str, Any]:
     profile_label, profile = _resolve_profile(session)
     conn, cur = _ensure_connection(session, profile_label, profile)
     active_cur = _require_cursor(conn, cur, profile_label)
-    diagnostics: Dict[str, Any] = {"profile": profile_label}
+
+    diagnostics: Dict[str, Any] = {"profile": profile_label, "errors": []}
+
+    try:
+        login_meta = detect_login_method(active_cur)
+        diagnostics["login"] = login_meta
+    except MistralDBError as exc:
+        diagnostics["login_error"] = str(exc)
+        diagnostics["errors"].append(f"login: {exc}")
 
     try:
         schema = detect_catalog_schema(active_cur)
     except MistralDBError as exc:
+        diagnostics["schema"] = {}
         diagnostics["schema_error"] = str(exc)
+        diagnostics["errors"].append(f"schema: {exc}")
         schema = {}
-
-    diagnostics["schema"] = schema
+    else:
+        diagnostics["schema"] = schema
 
     materials_table = schema.get("materials_table") if isinstance(schema, dict) else None
     barcode_table = schema.get("barcode_table") if isinstance(schema, dict) else None
@@ -516,6 +563,7 @@ def collect_db_diagnostics(session: Any) -> Dict[str, Any]:
             diagnostics["materials_count"] = active_cur.fetchone()[0]
         except Exception as exc:
             diagnostics["materials_error"] = str(exc)
+            diagnostics["errors"].append(f"materials: {exc}")
     else:
         diagnostics["materials_error"] = "Не е открита таблица с материали."
 
@@ -525,8 +573,11 @@ def collect_db_diagnostics(session: Any) -> Dict[str, Any]:
             diagnostics["barcode_count"] = active_cur.fetchone()[0]
         except Exception as exc:
             diagnostics["barcode_error"] = str(exc)
+            diagnostics["errors"].append(f"barcodes: {exc}")
     elif barcode_col:
         diagnostics["barcode_error"] = "Не е открита таблица за баркодове."
+
+    samples: Dict[str, Any] = {}
 
     if barcode_table and barcode_col:
         try:
@@ -537,43 +588,39 @@ def collect_db_diagnostics(session: Any) -> Dict[str, Any]:
             row = active_cur.fetchone()
             if row and row[0]:
                 barcode_value = str(row[0]).strip()
+                material = get_material_by_barcode(active_cur, barcode_value)
                 diagnostics["sample_barcode"] = barcode_value
-                item = get_item_by_barcode(active_cur, barcode_value)
-                diagnostics["sample_barcode_matches"] = [item] if item else []
+                diagnostics["sample_barcode_matches"] = [material.to_dict()] if material else []
+                samples["barcode"] = {
+                    "value": barcode_value,
+                    "material": material.to_dict() if material else None,
+                }
         except Exception as exc:
             diagnostics["sample_barcode_error"] = str(exc)
-
-    if materials_table and materials_code:
-        try:
-            active_cur.execute(
-                f"SELECT FIRST 1 TRIM({materials_code}) FROM {materials_table} "
-                f"WHERE TRIM({materials_code}) <> '' ORDER BY {materials_code}"
-            )
-            row = active_cur.fetchone()
-            if row and row[0]:
-                code_value = str(row[0]).strip()
-                diagnostics["sample_code"] = code_value
-                item = get_item_by_code(active_cur, code_value)
-                diagnostics["sample_code_matches"] = [item] if item else []
-        except Exception as exc:
-            diagnostics["sample_code_error"] = str(exc)
+            diagnostics["errors"].append(f"sample_barcode: {exc}")
 
     if materials_table and materials_name:
         try:
             active_cur.execute(
                 f"SELECT FIRST 1 TRIM({materials_name}) FROM {materials_table} "
-                f"WHERE TRIM({materials_name}) <> '' ORDER BY CHAR_LENGTH(TRIM({materials_name}))"
+                f"WHERE TRIM({materials_name}) <> ''"
             )
             row = active_cur.fetchone()
             if row and row[0]:
                 name_value = str(row[0]).strip()
                 diagnostics["sample_name"] = name_value
-                diagnostics["sample_name_matches"] = get_items_by_name(
-                    active_cur, name_value, limit=3
-                )
+                candidates = find_material_candidates(active_cur, name_value, limit=3)
+                diagnostics["sample_name_matches"] = [m.to_dict() for m in candidates]
+                samples["name"] = {
+                    "value": name_value,
+                    "candidates": [m.to_dict() for m in candidates],
+                }
         except Exception as exc:
             diagnostics["sample_name_error"] = str(exc)
+            diagnostics["errors"].append(f"sample_name: {exc}")
 
+    diagnostics["samples"] = samples
+    diagnostics["status"] = "FAIL" if diagnostics["errors"] else "OK"
     return diagnostics
 
 
