@@ -156,6 +156,69 @@ def get_last_login_trace() -> List[Dict[str, Any]]:
     return list(_LOGIN_TRACE)
 
 
+def _collect_table_login_candidates() -> List[Dict[str, Any]]:
+    table_candidates: List[Dict[str, Any]] = []
+    for table_name in ("USERS", "LOGUSERS"):
+        cols = _table_columns(table_name)
+        if not cols:
+            continue
+        upper_map = {col.upper(): col for col in cols}
+        login_candidates = (
+            "NAME",
+            "LOGIN",
+            "USERNAME",
+            "USER_NAME",
+            "CODE",
+            "USERCODE",
+            "OPERATOR",
+        )
+        login_col = None
+        for candidate in login_candidates:
+            if candidate in upper_map:
+                login_col = upper_map[candidate]
+                break
+        has_name = login_col is not None
+        has_pass = "PASS" in upper_map
+        if not has_pass:
+            continue
+        id_col = None
+        for candidate in ("ID", "CODE", "KOD", "USER_ID", "OP_ID"):
+            if candidate in upper_map:
+                id_col = upper_map[candidate]
+                break
+        if not id_col:
+            continue
+        salt_col = None
+        for candidate in ("SALT", "PASS_SALT", "PASSWORD_SALT", "SALT1"):
+            if candidate in upper_map:
+                salt_col = upper_map[candidate]
+                break
+        entry = {
+            "mode": "table",
+            "name": table_name,
+            "sp_kind": None,
+            "fields": {
+                "id": id_col,
+                "login": login_col,
+                "password": upper_map["PASS"],
+                "salt": salt_col,
+                "has_name": has_name,
+                "has_pass": has_pass,
+            },
+            "columns": cols,
+        }
+        table_candidates.append(entry)
+    return table_candidates
+
+
+def _prepare_table_meta(table_candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not table_candidates:
+        return None
+    primary = dict(table_candidates[0])
+    primary["candidates"] = table_candidates
+    return primary
+
+
 @contextmanager
 def _transaction() -> Iterable[Any]:
     conn = _require_connection()
@@ -471,6 +534,7 @@ def detect_login_method(cur: Any | None = None) -> Dict[str, Any]:
         """
     )
     procs = cur.fetchall()
+    table_candidates_cache: Optional[List[Dict[str, Any]]] = None
     for raw_name, proc_type in procs:
         name = (raw_name or "").strip()
         if not name:
@@ -530,70 +594,27 @@ def detect_login_method(cur: Any | None = None) -> Dict[str, Any]:
                     "outputs": outputs,
                 },
             }
+            if table_candidates_cache is None:
+                table_candidates_cache = _collect_table_login_candidates()
+            fallback_meta = _prepare_table_meta(table_candidates_cache or [])
+            if fallback_meta:
+                meta["fallback_table"] = fallback_meta
             logger.info(f"Открита login процедура: {name} ({sp_kind}).")
             return meta
 
-    table_candidates: List[Dict[str, Any]] = []
-    for table_name in ("USERS", "LOGUSERS"):
-        cols = _table_columns(table_name)
-        if not cols:
-            continue
-        upper_map = {col.upper(): col for col in cols}
-        login_candidates = (
-            "NAME",
-            "LOGIN",
-            "USERNAME",
-            "USER_NAME",
-            "CODE",
-            "USERCODE",
-            "OPERATOR",
-        )
-        login_col = None
-        for candidate in login_candidates:
-            if candidate in upper_map:
-                login_col = upper_map[candidate]
-                break
-        has_name = login_col is not None
-        has_pass = "PASS" in upper_map
-        if not has_pass:
-            continue
-        id_col = None
-        for candidate in ("ID", "CODE", "KOD", "USER_ID", "OP_ID"):
-            if candidate in upper_map:
-                id_col = upper_map[candidate]
-                break
-        if not id_col:
-            continue
-        salt_col = None
-        for candidate in ("SALT", "PASS_SALT", "PASSWORD_SALT", "SALT1"):
-            if candidate in upper_map:
-                salt_col = upper_map[candidate]
-                break
-        entry = {
-            "mode": "table",
-            "name": table_name,
-            "sp_kind": None,
-            "fields": {
-                "id": id_col,
-                "login": login_col,
-                "password": upper_map["PASS"],
-                "salt": salt_col,
-                "has_name": has_name,
-                "has_pass": has_pass,
-            },
-            "columns": cols,
-        }
-        table_candidates.append(entry)
-
-    if table_candidates:
-        primary = dict(table_candidates[0])
-        primary["candidates"] = table_candidates
-        has_name = "да" if primary["fields"].get("has_name") else "не"
-        has_pass = "да" if primary["fields"].get("has_pass") else "не"
+    if table_candidates_cache is None:
+        table_candidates_cache = _collect_table_login_candidates()
+    table_meta = _prepare_table_meta(table_candidates_cache or [])
+    if table_meta:
+        has_name = "да" if table_meta["fields"].get("has_name") else "не"
+        has_pass = "да" if table_meta["fields"].get("has_pass") else "не"
         logger.info(
-            f"Открит login чрез таблица: {primary['name']} (NAME={has_name}, PASS={has_pass})."
+            "Открит login чрез таблица: %s (NAME=%s, PASS=%s).",
+            table_meta["name"],
+            has_name,
+            has_pass,
         )
-        return primary
+        return table_meta
 
     logger.error("Не е открит механизъм за логин (профил: %s).", profile_label)
     raise UnsupportedAuthSchema(
@@ -621,6 +642,7 @@ def login_user(username: str, password: str) -> Tuple[int, str]:
     if _LOGIN_META is None:
         _LOGIN_META = detect_login_method(cur)
     meta = _LOGIN_META
+    meta["mode_used"] = meta.get("mode")
 
     _record_login_step(
         {
@@ -640,6 +662,7 @@ def login_user(username: str, password: str) -> Tuple[int, str]:
         if meta.get("mode") == "sp":
             result = _login_via_procedure(meta, username, password)
         else:
+            meta["mode_used"] = "table"
             result = _login_via_table(meta, username, password)
     except MistralDBError as exc:
         _record_login_step({"action": "failure", "message": str(exc)})
@@ -652,19 +675,20 @@ def login_user(username: str, password: str) -> Tuple[int, str]:
         raise
 
     operator_id, operator_login = result
+    mode_used = meta.get("mode_used", meta.get("mode"))
     _record_login_step(
         {
             "action": "success",
             "operator_id": operator_id,
             "operator_login": operator_login,
-            "mode": meta.get("mode"),
+            "mode": mode_used,
         }
     )
     logger.info(
         "Успешен вход (профил: %s, потребител: %s, режим: %s).",
         _profile_label(),
         username or operator_login or "<само парола>",
-        meta.get("mode"),
+        mode_used,
     )
     return operator_id, operator_login
 
@@ -725,6 +749,19 @@ def _extract_operator_from_row(
     return operator_id, operator_login
 
 
+def _resolve_table_fallback(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    fallback_meta = meta.get("fallback_table")
+    if fallback_meta:
+        return dict(fallback_meta)
+    _require_cursor()
+    table_candidates = _collect_table_login_candidates()
+    fallback_meta = _prepare_table_meta(table_candidates)
+    if fallback_meta:
+        meta["fallback_table"] = fallback_meta
+        return dict(fallback_meta)
+    return None
+
+
 def _login_via_procedure(meta: Dict[str, Any], username: str, password: str) -> Tuple[int, str]:
     cur = _require_cursor()
     name = meta.get("name")
@@ -733,6 +770,7 @@ def _login_via_procedure(meta: Dict[str, Any], username: str, password: str) -> 
     args = _build_procedure_args(inputs, username, password)
     placeholders = ", ".join(["?"] * len(inputs))
     sp_kind = meta.get("sp_kind") or "executable"
+    meta["mode_used"] = "sp"
 
     def _log_params() -> Dict[str, Any]:
         return {
@@ -802,6 +840,7 @@ def _login_via_procedure(meta: Dict[str, Any], username: str, password: str) -> 
                     row_count,
                 )
             operator_id, operator_login = _extract_operator_from_row(row, outputs, username)
+            meta["mode_used"] = "sp"
             return operator_id, operator_login
 
     exec_sql = (
@@ -882,6 +921,22 @@ def _login_via_procedure(meta: Dict[str, Any], username: str, password: str) -> 
                 "rows": 0,
             }
         )
+        fallback_meta = _resolve_table_fallback(meta)
+        if fallback_meta:
+            _record_login_step(
+                {
+                    "action": "procedure_fallback_table",
+                    "procedure": name,
+                    "table": fallback_meta.get("name"),
+                }
+            )
+            logger.info(
+                "Процедура %s не върна резултат – преминаваме към таблица %s.",
+                name,
+                fallback_meta.get("name"),
+            )
+            meta["mode_used"] = "table"
+            return _login_via_table(fallback_meta, username, password)
         raise MistralDBError("Невалиден потребител или парола")
 
     _record_login_step(
@@ -892,7 +947,9 @@ def _login_via_procedure(meta: Dict[str, Any], username: str, password: str) -> 
             "rows": 1,
         }
     )
-    return _extract_operator_from_row(row, outputs, username)
+    operator_id, operator_login = _extract_operator_from_row(row, outputs, username)
+    meta["mode_used"] = "sp"
+    return operator_id, operator_login
 
 
 def _login_via_table(meta: Dict[str, Any], username: str, password: str) -> Tuple[int, str]:

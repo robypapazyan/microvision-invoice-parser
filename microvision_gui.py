@@ -18,7 +18,7 @@ from tkinter import ttk, filedialog, messagebox
 import db_integration
 import extract_and_prepare
 
-from mistral_db import logger
+from mistral_db import get_last_login_trace, logger
 
 try:  # legacy fallback
     from db_integration import operator_login_session  # type: ignore
@@ -274,6 +274,12 @@ class MicroVisionApp:
                 lines.append(
                     f"{prefix}Превключване от {step.get('from')} към {step.get('to')}"
                 )
+            elif action == "procedure_callproc":
+                lines.append(f"{prefix}Опит за callproc: {step.get('procedure')}")
+            elif action == "procedure_fallback_table":
+                lines.append(
+                    f"{prefix}Fallback към таблица: {step.get('procedure')} → {step.get('table')}"
+                )
             elif action == "table_attempt":
                 lines.append(
                     f"{prefix}Таблица ({step.get('mode')}): {step.get('table')}"
@@ -295,7 +301,9 @@ class MicroVisionApp:
         return lines
 
     def _show_login_diagnostics(self) -> None:
-        trace = self.last_login_trace or db_integration.last_login_trace(self.session)
+        trace = get_last_login_trace() or self.last_login_trace
+        if not trace:
+            trace = db_integration.last_login_trace(self.session)
         if not trace:
             try:
                 messagebox.showinfo("Диагностика", "Няма налични данни от последния опит.")
@@ -317,6 +325,7 @@ class MicroVisionApp:
         scrollbar = ttk.Scrollbar(frame, command=text.yview)
         scrollbar.pack(side="right", fill="y")
         text.configure(yscrollcommand=scrollbar.set)
+        text.configure(font="TkFixedFont")
 
         lines = self._format_login_trace(trace)
         text.insert("1.0", "\n".join(lines))
