@@ -12,12 +12,12 @@ from mistral_db import (  # type: ignore[attr-defined]
     MistralDBError,
     connect,
     create_open_delivery,
-    db_resolve_item,
     detect_catalog_schema,
-    find_item_candidates_by_name,
+    get_items_by_name,
     get_item_by_barcode,
     get_item_by_code,
     get_last_login_trace,
+    resolve_item,
     logger,
     login_user,
     push_items_to_mistral,
@@ -33,6 +33,15 @@ _MAPPING_FILE = Path(__file__).with_name("mapping.json")
 _MATERIALS_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
 _MATERIALS_BY_BARCODE: Optional[Dict[str, Dict[str, Any]]] = None
 _MAPPING_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
+
+
+def _log_to_output(session: Any, message: str) -> None:
+    log_fn = getattr(session, "output_logger", None)
+    if callable(log_fn):
+        try:
+            log_fn(message)
+        except Exception:
+            logger.debug("Неуспешно записване в изходния прозорец: %s", message)
 
 
 def _normalize_token(value: str | None) -> str:
@@ -399,18 +408,51 @@ def resolve_items_from_db(session: Any, rows: List[Dict[str, Any]]) -> List[Dict
         working.pop("final_item", None)
 
         candidates: List[Dict[str, Any]] = []
-        if use_db and token:
-            try:
-                candidates = db_resolve_item(cur, token)
-            except MistralDBError as exc:
-                logger.error("Грешка при търсене в базата: %s", exc)
-                candidates = []
+        attempted_tokens: List[str] = []
+        matched_token: Optional[str] = None
+
+        if use_db and cur is not None:
+            search_tokens: List[str] = []
+            if barcode:
+                search_tokens.append(str(barcode))
+            if code:
+                search_tokens.append(str(code))
+            if name:
+                search_tokens.append(str(name))
+            if token:
+                search_tokens.append(str(token))
+
+            seen_tokens: set[str] = set()
+            for raw_token in search_tokens:
+                clean_token = " ".join(str(raw_token).split())
+                if not clean_token:
+                    continue
+                token_key = clean_token.lower()
+                if token_key in seen_tokens:
+                    continue
+                seen_tokens.add(token_key)
+                attempted_tokens.append(clean_token)
+                try:
+                    db_candidates = resolve_item(cur, clean_token)
+                except MistralDBError as exc:
+                    logger.error("Грешка при търсене в базата: %s", exc)
+                    candidates = []
+                    break
+                if db_candidates:
+                    candidates = [
+                        dict(candidate, source=candidate.get("source", "db"))
+                        for candidate in db_candidates
+                    ]
+                    matched_token = clean_token
+                    break
+
         if len(candidates) == 1:
-            apply_candidate_choice(working, candidates[0], candidates[0].get("source", "db"))
+            candidate = candidates[0]
+            apply_candidate_choice(working, candidate, candidate.get("source", "db"))
             stats["db"] += 1
             logger.info(
                 "DB resolve: еднозначно съвпадение → token=%s → код=%s",
-                token,
+                matched_token or token,
                 working["final_item"].get("code"),
             )
         elif len(candidates) > 1:
@@ -421,6 +463,12 @@ def resolve_items_from_db(session: Any, rows: List[Dict[str, Any]]) -> List[Dict
                 len(candidates),
             )
         else:
+            if use_db and attempted_tokens:
+                joined = ", ".join(f"„{value}“" for value in attempted_tokens)
+                message = f"⚠️ БД: не е намерен артикул за {joined}."
+                logger.warning("DB resolve: няма намерен артикул за %s", joined)
+                _log_to_output(session, message)
+
             fallback_candidate = _fallback_match(working, token)
             if fallback_candidate:
                 apply_candidate_choice(working, fallback_candidate, fallback_candidate.get("source", "mapping"))
@@ -520,7 +568,7 @@ def collect_db_diagnostics(session: Any) -> Dict[str, Any]:
             if row and row[0]:
                 name_value = str(row[0]).strip()
                 diagnostics["sample_name"] = name_value
-                diagnostics["sample_name_matches"] = find_item_candidates_by_name(
+                diagnostics["sample_name_matches"] = get_items_by_name(
                     active_cur, name_value, limit=3
                 )
         except Exception as exc:
@@ -784,7 +832,7 @@ def push_parsed_rows(session: Any, rows: List[Dict[str, Any]]) -> None:
             if candidate:
                 match_kind = "code"
         if candidate is None and name:
-            name_candidates = find_item_candidates_by_name(active_cur, name, limit=3)
+            name_candidates = get_items_by_name(active_cur, name, limit=3)
             if len(name_candidates) == 1:
                 candidate = name_candidates[0]
                 match_kind = "name"
