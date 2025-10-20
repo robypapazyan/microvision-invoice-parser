@@ -458,6 +458,27 @@ class MicroVisionApp:
                 if diag_info.get("login_error"):
                     diag_lines.append(f"Логин: грешка ({diag_info['login_error']})")
 
+                connection_info = diag_info.get("connection") if isinstance(diag_info, dict) else None
+                if isinstance(connection_info, dict):
+                    driver_name = diag_info.get("driver") or connection_info.get("driver")
+                    if driver_name:
+                        diag_lines.append(f"Драйвер: {driver_name}")
+                    dsn_value = connection_info.get("dsn")
+                    if dsn_value:
+                        diag_lines.append(f"DSN: {dsn_value}")
+                    else:
+                        host_value = connection_info.get("host") or "—"
+                        port_value = connection_info.get("port")
+                        database_value = connection_info.get("database") or "—"
+                        if port_value is not None:
+                            diag_lines.append(f"Host: {host_value}:{port_value}")
+                        else:
+                            diag_lines.append(f"Host: {host_value}")
+                        diag_lines.append(f"Database: {database_value}")
+                    charset_value = connection_info.get("charset")
+                    if charset_value:
+                        diag_lines.append(f"Charset: {charset_value}")
+
                 schema_info = diag_info.get("schema") or {}
                 if isinstance(schema_info, dict) and schema_info.get("materials_table"):
                     diag_lines.append(

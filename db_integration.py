@@ -20,6 +20,8 @@ from mistral_db import (  # type: ignore[attr-defined]
     get_item_by_barcode,
     get_item_by_code,
     get_items_by_name,
+    get_active_driver,
+    get_connection_info,
     get_last_login_trace,
     get_material_by_barcode,
     logger,
@@ -534,6 +536,27 @@ def collect_db_diagnostics(session: Any) -> Dict[str, Any]:
     active_cur = _require_cursor(conn, cur, profile_label)
 
     diagnostics: Dict[str, Any] = {"profile": profile_label, "errors": []}
+    connection_info = get_connection_info()
+    if connection_info:
+        diagnostics["connection"] = connection_info
+    else:
+        trace = get_last_login_trace()
+        connection_entries = [
+            entry
+            for entry in trace
+            if isinstance(entry, dict)
+            and entry.get("action") in {"connect_success", "connect_attempt"}
+        ]
+        if connection_entries:
+            diagnostics["connection"] = dict(connection_entries[-1])
+
+    driver_name = get_active_driver()
+    if driver_name:
+        diagnostics["driver"] = driver_name
+    elif diagnostics.get("connection"):
+        driver_from_conn = diagnostics["connection"].get("driver")
+        if driver_from_conn:
+            diagnostics["driver"] = driver_from_conn
 
     try:
         login_meta = detect_login_method(active_cur)
@@ -766,6 +789,10 @@ def initialize_session(session: Any, profile_key: str) -> Tuple[Any, Any]:
     session.cur = cur
     session.profile_label = profile_key
     session.profile_data = profile
+    try:
+        session.connection_info = get_connection_info()
+    except Exception:
+        session.connection_info = {}
     logger.info("Успешно свързване за профил: %s", profile_key)
     return conn, cur
 
@@ -787,6 +814,10 @@ def _ensure_connection(session: Any, profile_label: str, profile: Dict[str, Any]
     session.cur = cur
     session.profile_label = profile_label
     session.profile_data = profile
+    try:
+        session.connection_info = get_connection_info()
+    except Exception:
+        session.connection_info = {}
     return conn, cur
 
 
