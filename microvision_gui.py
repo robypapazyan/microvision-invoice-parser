@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -167,6 +167,178 @@ class CandidateDialog(tk.Toplevel):
 
 
 
+class ItemResolverDialog(tk.Toplevel):
+    """Интерактивен диалог за избор/създаване на mapping."""
+
+    def __init__(
+        self,
+        parent: tk.Tk,
+        resolver: Optional[db_integration.DbItemResolver],
+        description: str,
+        barcode: Optional[str],
+        initial_hits: List[db_integration.ItemHit],
+        default_mapping_kind: Optional[str] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.resolver = resolver
+        self._hits: List[db_integration.ItemHit] = list(initial_hits)
+        self._manual_hit: Optional[db_integration.ItemHit] = None
+        self._default_mapping_kind = default_mapping_kind
+        self.result: Optional[Dict[str, Any]] = None
+
+        self.title("Избор на материал")
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        info_text = description or "(без описание)"
+        ttk.Label(frame, text="Описание от фактурата:", font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        descr_box = tk.Text(frame, height=3, width=60, wrap="word", relief="groove", borderwidth=1)
+        descr_box.pack(fill="x", pady=(0, 8))
+        descr_box.insert("1.0", info_text)
+        descr_box.configure(state="disabled")
+
+        if barcode:
+            ttk.Label(frame, text=f"Баркод: {barcode}", foreground="#555").pack(anchor="w", pady=(0, 6))
+
+        search_row = ttk.Frame(frame)
+        search_row.pack(fill="x")
+        ttk.Label(search_row, text="Търси по име:").pack(side="left")
+        self.search_var = tk.StringVar(value=description or "")
+        self.search_entry = ttk.Entry(search_row, textvariable=self.search_var, width=40)
+        self.search_entry.pack(side="left", padx=(4, 4))
+        self.search_entry.bind("<Return>", self._on_search)
+        self.search_btn = ttk.Button(search_row, text="Търси", command=self._on_search)
+        self.search_btn.pack(side="left")
+
+        ttk.Label(frame, text="Резултати:").pack(anchor="w", pady=(8, 0))
+        self.listbox = tk.Listbox(frame, height=10, width=60, exportselection=False)
+        self.listbox.pack(fill="both", expand=True, pady=(4, 8))
+        self.listbox.bind("<<ListboxSelect>>", self._on_selection_change)
+        self.listbox.bind("<Double-Button-1>", self._on_confirm)
+
+        manual_row = ttk.Frame(frame)
+        manual_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(manual_row, text="Ръчно въведен код:").pack(side="left")
+        self.manual_var = tk.StringVar()
+        self.manual_entry = ttk.Entry(manual_row, textvariable=self.manual_var, width=18)
+        self.manual_entry.pack(side="left", padx=(4, 4))
+        self.manual_btn = ttk.Button(manual_row, text="Провери код", command=self._on_check_manual)
+        self.manual_btn.pack(side="left")
+
+        self.status_var = tk.StringVar()
+        ttk.Label(frame, textvariable=self.status_var, foreground="#555").pack(anchor="w", pady=(4, 4))
+
+        check_text = "Запази mapping за този баркод" if barcode else "Запази mapping по текст"
+        self.save_var = tk.BooleanVar(value=bool(default_mapping_kind))
+        self.save_checkbox = ttk.Checkbutton(frame, text=check_text, variable=self.save_var)
+        self.save_checkbox.pack(anchor="w", pady=(0, 6))
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x")
+        self.ok_btn = ttk.Button(buttons, text="Избери", command=self._on_confirm)
+        self.ok_btn.pack(side="left")
+        ttk.Button(buttons, text="Отказ", command=self._on_cancel).pack(side="right")
+
+        if resolver is None:
+            self.search_btn.state(["disabled"])
+            self.manual_btn.state(["disabled"])
+            self.status_var.set("Няма връзка с БД – наличен е само ръчен избор.")
+
+        self._populate_hits(self._hits)
+        if self._hits:
+            self.listbox.selection_set(0)
+        self.search_entry.focus_set()
+
+    # ----------------- helpers -----------------
+    def _populate_hits(self, hits: List[db_integration.ItemHit]) -> None:
+        self.listbox.delete(0, tk.END)
+        for hit in hits:
+            label = f"{hit['code']} | {hit['name']}"
+            self.listbox.insert(tk.END, label)
+        if not hits:
+            self.status_var.set("Няма резултати.")
+
+    def _on_selection_change(self, _event: Any = None) -> None:
+        self._manual_hit = None
+        if self.listbox.curselection():
+            self.ok_btn.state(["!disabled"])
+        else:
+            self.ok_btn.state(["disabled"])
+
+    def _on_search(self, _event: Any = None) -> None:
+        if self.resolver is None:
+            return
+        query = self.search_var.get().strip()
+        if not query:
+            self.status_var.set("Въведете текст за търсене.")
+            return
+        hits = self.resolver.resolve_by_name(query, limit=20)
+        seen: set[str] = set()
+        combined: List[db_integration.ItemHit] = []
+        for hit in hits:
+            if hit["code"] in seen:
+                continue
+            seen.add(hit["code"])
+            combined.append(hit)
+        self._hits = combined
+        self._populate_hits(combined)
+        if combined:
+            self.listbox.selection_set(0)
+            self.status_var.set(f"Намерени резултати: {len(combined)}")
+        else:
+            self.status_var.set("Няма резултати.")
+
+    def _on_check_manual(self) -> None:
+        if self.resolver is None:
+            return
+        code = self.manual_var.get().strip()
+        if not code:
+            self.status_var.set("Въведете код за проверка.")
+            return
+        hit = self.resolver.ensure_item(code)
+        if hit:
+            self._manual_hit = hit
+            self.status_var.set(f"Кодът е намерен: {hit['name']}")
+            self.ok_btn.state(["!disabled"])
+        else:
+            self._manual_hit = None
+            self.status_var.set("Кодът не е намерен.")
+
+    def _on_confirm(self, _event: Any = None) -> None:
+        chosen_hit: Optional[db_integration.ItemHit] = None
+        mapping_kind = self._default_mapping_kind
+        if self._manual_hit is not None:
+            chosen_hit = self._manual_hit
+            mapping_kind = "barcode" if mapping_kind == "barcode" else "manual"
+        else:
+            selection = self.listbox.curselection()
+            if selection:
+                chosen_hit = self._hits[int(selection[0])]
+        if chosen_hit is None:
+            self.status_var.set("Изберете резултат или проверете код.")
+            return
+        self.result = {
+            "hit": chosen_hit,
+            "save_mapping": bool(self.save_var.get()),
+            "mapping_kind": mapping_kind or "text",
+        }
+        self.destroy()
+
+    def _on_cancel(self) -> None:
+        self.result = None
+        self.destroy()
+
+    def show(self) -> Optional[Dict[str, Any]]:
+        self.wait_window()
+        return self.result
+
+
+
 # -------------------------
 # Помощни функции
 # -------------------------
@@ -240,6 +412,7 @@ class MicroVisionApp:
         self.status_summary_var = tk.StringVar(
             value="Намерени в БД: 0 | чрез mapping: 0 | нерешени: 0"
         )
+        self.mapping_store = db_integration.Mapping()
 
         self._build_ui()
         self.session.db_mode = bool(self.db_mode_var.get())
@@ -753,36 +926,14 @@ class MicroVisionApp:
             self._log("⚠️ Върнатият резултат не е списък с редове.")
             return
 
-        resolver = getattr(db_integration, "resolve_items_from_db", None)
-        if callable(resolver):
-            rows = resolver(self.session, rows)
-            unresolved = getattr(self.session, "unresolved_items", [])
-            if unresolved:
-                preview = ", ".join(
-                    filter(
-                        None,
-                        [
-                            (entry.get("token") or entry.get("name") or entry.get("barcode") or "?")
-                            for entry in unresolved[:3]
-                            if isinstance(entry, dict)
-                        ],
-                    )
-                )
-                suffix = f" ({preview})" if preview else ""
-                self._log(
-                    f"📝 Нерешени редове за последваща обработка: {len(unresolved)}{suffix}"
-                )
-        else:
-            self._log("⚠️ Липсва DB резолвер – използвам суровите редове.")
+        if not self._resolve_rows(rows):
+            self._update_status_summary(rows)
+            return
 
         self.rows_cache = rows
         count = len(rows)
         if count == 0:
             self._log("ℹ️ Няма разпознати редове в документа.")
-            self._update_status_summary(rows)
-            return
-
-        if not self._resolve_candidate_dialogs(rows):
             self._update_status_summary(rows)
             return
 
@@ -804,83 +955,265 @@ class MicroVisionApp:
     def _update_status_summary(self, rows: List[Dict[str, Any]]) -> None:
         db_count = 0
         mapping_count = 0
+        manual_count = 0
         for row in rows:
             final = row.get("final_item") or {}
             source = final.get("source")
-            if source == "db":
+            if source in {"db-barcode", "db-text"}:
                 db_count += 1
-            elif source == "mapping":
+            elif source in {"mapping-barcode", "mapping-text"}:
                 mapping_count += 1
-        unresolved = max(len(rows) - db_count - mapping_count, 0)
+            elif source == "manual":
+                manual_count += 1
+        unresolved = max(len(rows) - db_count - mapping_count - manual_count, 0)
         summary = (
-            f"Намерени в БД: {db_count} | чрез mapping: {mapping_count} | нерешени: {unresolved}"
+            f"Намерени в БД: {db_count} | чрез mapping: {mapping_count} | ръчни: {manual_count} | нерешени: {unresolved}"
         )
         self.status_summary_var.set(summary)
 
-    def _candidate_label(self, candidate: Dict[str, Any]) -> str:
-        code = candidate.get("code") or "—"
-        name = candidate.get("name") or "без име"
-        match_kind = candidate.get("match") or candidate.get("source")
-        suffix = ""
-        if match_kind == "barcode":
-            suffix = " (по баркод)"
-        elif match_kind == "code":
-            suffix = " (по код)"
-        elif match_kind == "name":
-            suffix = " (по име)"
-        elif match_kind == "mapping":
-            suffix = " (fallback mapping)"
-        return f"{code} | {name}{suffix}"
+    def _determine_supplier_key(self, row: Optional[Dict[str, Any]] = None) -> str:
+        profile = self.session.profile_data or {}
+        supplier = None
+        if isinstance(row, dict):
+            for key in ("supplier_id", "supplier", "issuer", "issuer_id"):
+                value = row.get(key)
+                if value not in (None, ""):
+                    supplier = value
+                    break
+        if supplier in (None, ""):
+            supplier = profile.get("default_supplier_id")
+        if supplier in (None, ""):
+            supplier = profile.get("name") or self.active_profile_name or "DEFAULT"
+        return str(supplier)
 
-    def _show_candidate_dialog(self, row: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Optional[int | str]:
-        token = row.get("token") or row.get("raw") or "(без токен)"
-        labels = [self._candidate_label(candidate) for candidate in candidates]
-        dialog = CandidateDialog(self.root, token, labels)
-        return dialog.show()
+    @staticmethod
+    def _row_first(row: Dict[str, Any], keys: Iterable[str]) -> Optional[str]:
+        for key in keys:
+            if key not in row:
+                continue
+            value = row.get(key)
+            if isinstance(value, str):
+                cleaned = value.strip()
+                if cleaned:
+                    return cleaned
+            elif value not in (None, ""):
+                return str(value)
+        return None
 
-    def _resolve_candidate_dialogs(self, rows: List[Dict[str, Any]]) -> bool:
-        for index, row in enumerate(rows, start=1):
-            payload = row.get("resolved")
-            if not isinstance(payload, dict):
-                continue
-            candidates = payload.get("candidates")
-            if not isinstance(candidates, list) or not candidates:
-                continue
-            choice = self._show_candidate_dialog(row, candidates)
-            if choice == "cancel":
-                self._log("⚠️ Изборът е прекъснат от потребителя.")
-                return False
-            if choice == "skip":
-                row["resolved"] = None
-                row["final_item"] = None
-                self._log(f"ℹ️ Ред {index} е оставен нерешен по избор на потребителя.")
-                continue
-            if isinstance(choice, int) and 0 <= choice < len(candidates):
-                candidate = candidates[choice]
-                apply_choice = getattr(db_integration, "apply_candidate_choice", None)
-                if callable(apply_choice):
-                    apply_choice(row, candidate, candidate.get("source", "db"))
-                else:
-                    row["resolved"] = dict(candidate)
-                    row["resolved"]["source"] = candidate.get("source", "db")
-                    row["final_item"] = {
-                        "material_id": candidate.get("id"),
-                        "code": candidate.get("code"),
-                        "name": candidate.get("name"),
-                        "qty": row.get("qty") or row.get("quantity") or 1,
-                        "price": row.get("price") or row.get("unit_price") or 0,
-                        "vat": row.get("vat") or 0,
-                        "barcode": candidate.get("barcode"),
-                        "sale_price": row.get("sale_price"),
-                        "source": candidate.get("source", "db"),
-                        "match_kind": candidate.get("match"),
-                    }
+    def _row_token(self, row: Dict[str, Any]) -> str:
+        token = row.get("token")
+        if isinstance(token, str) and token.strip():
+            return token.strip()
+        candidate = self._row_first(
+            row,
+            ("description", "name", "raw", "product", "item_name", "Наименование", "Описание"),
+        )
+        return candidate or ""
+
+    def _apply_hit(
+        self,
+        row: Dict[str, Any],
+        hit: db_integration.ItemHit,
+        source: str,
+        match_kind: str,
+        barcode: Optional[str],
+    ) -> None:
+        candidate = {
+            "id": None,
+            "code": hit["code"],
+            "name": hit["name"],
+            "barcode": barcode,
+            "match": match_kind,
+            "source": source,
+        }
+        db_integration.apply_candidate_choice(row, candidate, source)
+
+    def _resolve_rows(self, rows: List[Dict[str, Any]]) -> bool:
+        mapping = self.mapping_store
+        supplier_key = self._determine_supplier_key()
+        resolver: Optional[db_integration.DbItemResolver] = None
+        cur = getattr(self.session, "cur", None)
+        if cur is not None:
+            try:
+                resolver = db_integration.DbItemResolver(cur)
+                self.session.catalog = resolver.catalog
+                catalog = resolver.catalog
                 self._log(
-                    f"✅ Избран артикул за ред {index}: {candidate.get('code') or '—'}"
+                    "Каталожна схема: MATERIAL({}) ↔ BARCODE(code={}, fk={})",
+                    catalog.get("code_id_col") or "MATERIALCODE",
+                    catalog.get("code_col") or "CODE",
+                    catalog.get("fk_col") or "FK_STORAGEMATERIALCODE",
                 )
-            else:
-                self._log(f"ℹ️ Ред {index} остава без избор.")
+            except db_integration.MistralDBError as exc:
+                self._log(f"⚠️ Схема неразпозната: {exc}")
+                messagebox.showerror("Схема", f"Каталогът не може да бъде детектиран: {exc}")
+                return False
+
+        stats = {"mapping": 0, "db": 0, "manual": 0, "unresolved": 0}
+        unresolved_entries: List[Dict[str, Any]] = []
+
+        for index, row in enumerate(rows, start=1):
+            outcome = self._resolve_single_row(index, row, resolver, mapping, supplier_key)
+            if outcome == "cancel":
+                self._log("⚠️ Обработката е прекъсната от потребителя.")
+                self.session.unresolved_items = unresolved_entries
+                return False
+            if outcome is None:
+                stats["unresolved"] += 1
+                unresolved_entries.append(
+                    {
+                        "token": self._row_token(row),
+                        "barcode": self._row_first(row, ("barcode", "Баркод", "EAN")),
+                        "name": self._row_first(row, ("name", "description", "Наименование")),
+                    }
+                )
+            elif outcome in stats:
+                stats[outcome] += 1
+
+        self.session.unresolved_items = unresolved_entries
+        self.session.last_resolution_stats = stats
+        if unresolved_entries:
+            preview = ", ".join(
+                filter(
+                    None,
+                    [
+                        (entry.get("token") or entry.get("name") or entry.get("barcode") or "?")
+                        for entry in unresolved_entries[:3]
+                    ],
+                )
+            )
+            suffix = f" ({preview})" if preview else ""
+            self._log(
+                f"📝 Нерешени редове за последваща обработка: {len(unresolved_entries)}{suffix}"
+            )
         return True
+
+    def _resolve_single_row(
+        self,
+        index: int,
+        row: Dict[str, Any],
+        resolver: Optional[db_integration.DbItemResolver],
+        mapping: db_integration.Mapping,
+        supplier_key: str,
+    ) -> Optional[str]:
+        row["resolved"] = None
+        row["final_item"] = None
+        token = self._row_token(row)
+        row["token"] = token
+        barcode = self._row_first(row, ("barcode", "Баркод", "EAN", "ean", "Barcode"))
+        description = self._row_first(
+            row,
+            (
+                "description",
+                "name",
+                "product",
+                "item_name",
+                "Наименование",
+                "Описание",
+                "raw",
+            ),
+        ) or token
+
+        def _log_choice(hit: db_integration.ItemHit, source: str) -> None:
+            logger.info(
+                "Lookup: {} → код={} | име={}",
+                source,
+                hit["code"],
+                hit["name"],
+            )
+
+        def _safe_call(func: Callable[..., Any], *args: Any) -> Any:
+            try:
+                return func(*args)
+            except Exception as exc:
+                logger.error("DB lookup error: {}", exc)
+                self._log(f"⚠️ БД грешка: {exc}")
+                return None
+
+        # Mapping по баркод
+        if barcode:
+            mapped_code = mapping.get_mapped_barcode(supplier_key, barcode)
+            if mapped_code:
+                hit = _safe_call(resolver.ensure_item, mapped_code) if resolver else None
+                if hit:
+                    self._apply_hit(row, hit, "mapping-barcode", "barcode", barcode)
+                    self._log(f"✅ Ред {index}: mapping по баркод → {hit['code']}")
+                    _log_choice(hit, "mapping-barcode")
+                    return "mapping"
+                else:
+                    self._log(
+                        f"⚠️ Ред {index}: mapping по баркод е невалиден за код {mapped_code}."
+                    )
+
+        # Mapping по текст
+        if description:
+            mapped_code = mapping.get_mapped_text(supplier_key, description)
+            if mapped_code:
+                hit = _safe_call(resolver.ensure_item, mapped_code) if resolver else None
+                if hit:
+                    self._apply_hit(row, hit, "mapping-text", "text", barcode)
+                    self._log(f"✅ Ред {index}: mapping по текст → {hit['code']}")
+                    _log_choice(hit, "mapping-text")
+                    return "mapping"
+                else:
+                    self._log(
+                        f"⚠️ Ред {index}: mapping по текст е невалиден за код {mapped_code}."
+                    )
+
+        if resolver is None:
+            return None
+
+        hits: List[db_integration.ItemHit] = []
+        mapping_kind: Optional[str] = None
+        barcode_hit = _safe_call(resolver.resolve_by_barcode, barcode or "") if barcode else None
+        if barcode_hit:
+            hits.append(barcode_hit)
+            mapping_kind = "barcode"
+        name_hits = (
+            _safe_call(resolver.resolve_by_name, description or token or "")
+            if (description or token)
+            else []
+        ) or []
+        seen_codes = {hit["code"] for hit in hits}
+        for hit in name_hits:
+            if hit["code"] in seen_codes:
+                continue
+            seen_codes.add(hit["code"])
+            hits.append(hit)
+        dialog = ItemResolverDialog(
+            self.root,
+            resolver,
+            description or token or "",
+            barcode,
+            hits,
+            mapping_kind or ("text" if description else None),
+        )
+        choice = dialog.show()
+        if choice is None:
+            return "cancel"
+        hit = choice.get("hit") if isinstance(choice, dict) else None
+        if not hit:
+            return None
+        mapping_type = choice.get("mapping_kind") or "text"
+        save_mapping = bool(choice.get("save_mapping"))
+        if mapping_type == "barcode" and barcode:
+            self._apply_hit(row, hit, "db-barcode", "barcode", barcode)
+            source_key = "db"
+            if save_mapping:
+                mapping.set_mapped_barcode(supplier_key, barcode, hit["code"])
+        elif mapping_type == "manual":
+            self._apply_hit(row, hit, "manual", "manual", barcode)
+            source_key = "manual"
+            if save_mapping and description:
+                mapping.set_mapped_text(supplier_key, description, hit["code"])
+        else:
+            self._apply_hit(row, hit, "db-text", "text", barcode)
+            source_key = "db"
+            if save_mapping and description:
+                mapping.set_mapped_text(supplier_key, description, hit["code"])
+        self._log(f"✅ Ред {index}: избран материал {hit['code']}")
+        _log_choice(hit, row.get("final_item", {}).get("source") or source_key)
+        return source_key
 
     def _preview_rows(self, rows: List[Dict[str, Any]]) -> None:
         preview_count = min(5, len(rows))

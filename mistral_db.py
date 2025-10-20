@@ -296,11 +296,10 @@ class FirebirdDriverClient(_BaseFbClient):
         database_path = _normalize_database_path(database)
         host_clean = str(host or "").strip()
         port_value = int(port) if port else 0
-        dsn = f"{host_clean}/{port_value}:{database_path}" if host_clean else database_path
         self._info = {
             "driver": "firebird-driver",
             "function": "firebird.driver.connect",
-            "dsn": dsn,
+            "dsn": None,
             "host": host_clean,
             "port": port_value,
             "database": database_path,
@@ -308,13 +307,19 @@ class FirebirdDriverClient(_BaseFbClient):
             "charset": charset,
         }
         _log_info(
-            f"Използва се firebird-driver (dsn={dsn}, charset={charset})"
+            "Използва се firebird-driver (host={}, port={}, database={}, charset={})",
+            host_clean or "<локален>",
+            port_value or "<по подразбиране>",
+            database_path,
+            charset,
         )
         trace_payload = dict(self._info)
         _trace("connect_attempt", **trace_payload, password=password)
         try:
             self._conn = fbdrv_connect(
-                dsn=dsn,
+                host=host or None,
+                port=port,
+                database=database_path,
                 user=user,
                 password=password,
                 charset=charset,
@@ -323,7 +328,7 @@ class FirebirdDriverClient(_BaseFbClient):
             failure_payload = _exception_trace_payload(trace_payload, exc)
             _trace("connect_failure", **failure_payload)
             _log_error(
-                f"firebird.driver.connect(dsn={dsn}, user={user}, charset={charset}) → {exc}"
+                f"firebird.driver.connect(host={host_clean}, port={port_value}, database={database_path}, charset={charset}) → {exc}"
             )
             raise
         else:
@@ -422,18 +427,11 @@ def get_short_path(path: str) -> str:
 
 
 def _normalize_database_path(database: str) -> str:
-    """Ако пътят съдържа не-ASCII символи → връщаме short-path версията."""
+    """Връща подадения път без преобразуване."""
 
     fs_path = os.fspath(database)
     if not isinstance(fs_path, str):
         fs_path = str(fs_path)
-    fs_path = os.path.normpath(fs_path)
-    if os.name != "nt":
-        return fs_path
-    if any(ord(ch) > 127 for ch in fs_path):
-        short = get_short_path(fs_path)
-        if short:
-            return short
     return fs_path
 
 
@@ -482,7 +480,9 @@ def _select_driver(profile: Dict[str, Any]) -> Tuple[str, Type[BaseException]]:
         candidates.append(requested)
     else:
         # Поддържаме обратно съвместимост – пробваме наличните по приоритет.
-        candidates.extend([drv for drv in ("fdb", "firebird-driver") if drv not in candidates])
+        candidates.extend([
+            drv for drv in ("firebird-driver", "fdb") if drv not in candidates
+        ])
 
     errors: List[str] = []
     for name in candidates:
@@ -1111,18 +1111,85 @@ def _detect_catalog_schema_from_map(columns_map: Dict[str, List[str]]) -> Dict[s
 
 
 def detect_catalog_schema(cur: Any | None = None, force_refresh: bool = False) -> Dict[str, str | None]:
-    """Открива ключовите таблици и колони за артикули и баркодове."""
+    """Открива таблиците MATERIAL и BARCODE и ключовите им колони."""
 
     global _CATALOG_SCHEMA
     if _CATALOG_SCHEMA is not None and not force_refresh:
         return dict(_CATALOG_SCHEMA)
 
     active_cur = _require_cursor(cur=cur)
-    columns_map = _collect_relation_columns(active_cur)
-    if not columns_map:
-        columns_map = _parse_schema_dump()
-    schema = _detect_catalog_schema_from_map(columns_map)
+
+    def _relation_columns(table: str) -> List[str]:
+        sql = (
+            "SELECT TRIM(RDB$FIELD_NAME) FROM RDB$RELATION_FIELDS "
+            "WHERE RDB$RELATION_NAME = ? ORDER BY RDB$FIELD_POSITION"
+        )
+        active_cur.execute(sql, (table.upper(),))
+        rows = active_cur.fetchall() or []
+        columns: List[str] = []
+        for row in rows:
+            if not row:
+                continue
+            name = row[0]
+            if name is None:
+                continue
+            text = str(name).strip().upper()
+            if text:
+                columns.append(text)
+        return columns
+
+    materials_table = "MATERIAL"
+    barcode_table = "BARCODE"
+    materials_columns = _relation_columns(materials_table)
+    if not materials_columns:
+        raise MistralDBError("Схема неразпозната: липсва таблица MATERIAL.")
+
+    required_material_cols = {
+        "MATERIALCODE": "код на материал",
+        "MATERIAL": "име на материал",
+    }
+    for column, human_name in required_material_cols.items():
+        if column not in materials_columns:
+            raise MistralDBError(
+                f"Схема неразпозната: MATERIAL няма колона {column} ({human_name})."
+            )
+
+    barcode_columns = _relation_columns(barcode_table)
+    if not barcode_columns:
+        raise MistralDBError("Схема неразпозната: липсва таблица BARCODE.")
+
+    code_candidates = ["CODE", "BARCODE", "EAN", "EAN13"]
+    barcode_code_col = next((col for col in code_candidates if col in barcode_columns), None)
+    if not barcode_code_col:
+        raise MistralDBError(
+            "Схема неразпозната: BARCODE няма разпознаваема колона за баркод (CODE/EAN)."
+        )
+
+    fk_candidates = ["FK_STORAGEMATERIALCODE", "STORAGEMATERIALCODE"]
+    barcode_fk_col = next((col for col in fk_candidates if col in barcode_columns), None)
+    if not barcode_fk_col:
+        raise MistralDBError(
+            "Схема неразпозната: BARCODE няма FK към MATERIAL (FK_STORAGEMATERIALCODE/STORAGEMATERIALCODE)."
+        )
+
+    schema = {
+        "materials_table": materials_table,
+        "materials_code": "MATERIALCODE",
+        "materials_name": "MATERIAL",
+        "materials_id": None,
+        "barcode_table": barcode_table,
+        "barcode_col": barcode_code_col,
+        "barcode_mat_fk": barcode_fk_col,
+        "code_col": barcode_code_col,
+        "fk_col": barcode_fk_col,
+        "code_name_col": "MATERIAL",
+        "code_id_col": "MATERIALCODE",
+    }
+
     _CATALOG_SCHEMA = dict(schema)
+    _log_info(
+        f"Каталожна схема: MATERIAL({schema['materials_code']}) / BARCODE(code={barcode_code_col}, fk={barcode_fk_col})"
+    )
     return schema
 
 
