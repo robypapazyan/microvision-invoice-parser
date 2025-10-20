@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import ipaddress
 import os
 import sys
 from contextlib import contextmanager
@@ -14,7 +15,71 @@ from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Tupl
 
 import re
 
-from loguru import logger
+try:  # pragma: no cover - optional dependency
+    from loguru import logger
+except Exception:  # pragma: no cover - защитно
+    import logging
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+
+    class _FauxLogger:
+        """Лек заместител на loguru.logger при липсващ пакет."""
+
+        def __init__(self) -> None:
+            self._handlers: List[logging.Handler] = []
+
+        def debug(self, *args: Any, **kwargs: Any) -> None:
+            logging.debug(*args, **kwargs)
+
+        def info(self, *args: Any, **kwargs: Any) -> None:
+            logging.info(*args, **kwargs)
+
+        def warning(self, *args: Any, **kwargs: Any) -> None:
+            logging.warning(*args, **kwargs)
+
+        def error(self, *args: Any, **kwargs: Any) -> None:
+            logging.error(*args, **kwargs)
+
+        def exception(self, *args: Any, **kwargs: Any) -> None:
+            logging.exception(*args, **kwargs)
+
+        def bind(self, **_kwargs: Any) -> "_FauxLogger":
+            return self
+
+        def add(self, sink: Any, level: str = "INFO", **kwargs: Any) -> int:
+            logger_obj = logging.getLogger()
+            formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+            if hasattr(sink, "write"):
+                handler = logging.StreamHandler(stream=sink)
+            else:
+                encoding = kwargs.get("encoding") or "utf-8"
+                handler = logging.FileHandler(sink, encoding=encoding)
+            handler.setLevel(getattr(logging, level.upper(), logging.INFO))
+            handler.setFormatter(formatter)
+            logger_obj.addHandler(handler)
+            self._handlers.append(handler)
+            return id(handler)
+
+        def remove(self, handler_id: Any | None = None) -> None:
+            logger_obj = logging.getLogger()
+            if handler_id is None:
+                targets = list(self._handlers)
+            else:
+                targets = [
+                    handler for handler in self._handlers if id(handler) == handler_id
+                ]
+            for handler in targets:
+                try:
+                    logger_obj.removeHandler(handler)
+                finally:
+                    handler.close()
+                    if handler in self._handlers:
+                        self._handlers.remove(handler)
+
+    logger = _FauxLogger()
 
 
 _LOG_CONFIGURED = False
@@ -209,10 +274,16 @@ class FirebirdDriverClient(_BaseFbClient):
         if _firebird_connect is None:
             raise ImportError("firebird-driver не е наличен")
         database_path = _normalize_database_path(database)
+        host_clean = str(host or "").strip()
+        dsn: str
+        if host_clean and not _is_loopback_host(host_clean):
+            port_fragment = f"/{int(port)}" if int(port) else ""
+            dsn = f"{host_clean}{port_fragment}:{database_path}"
+        else:
+            dsn = database_path
+        _log_info("Използва се firebird-driver", driver="firebird-driver", dsn=dsn, charset=charset)
         self._conn = _firebird_connect(  # type: ignore[misc]
-            host=host,
-            port=port,
-            database=database_path,
+            dsn=dsn,
             user=user,
             password=password,
             charset=charset,
@@ -235,6 +306,7 @@ class FdbClient(_BaseFbClient):
         if fdb is None:
             raise ImportError("fdb не е наличен")
         database_path = _normalize_database_path(database)
+        _log_info("Използва се fdb драйвер", driver="fdb", database=database_path, charset=charset)
         self._conn = fdb.connect(  # type: ignore[arg-type]
             host=host,
             port=port,
@@ -295,6 +367,7 @@ def _normalize_database_path(database: str) -> str:
     fs_path = os.fspath(database)
     if not isinstance(fs_path, str):
         fs_path = str(fs_path)
+    fs_path = os.path.normpath(fs_path)
     if os.name != "nt":
         return fs_path
     if any(ord(ch) > 127 for ch in fs_path):
@@ -302,6 +375,18 @@ def _normalize_database_path(database: str) -> str:
         if short:
             return short
     return fs_path
+
+
+def _is_loopback_host(host: str) -> bool:
+    host_clean = host.strip().lower()
+    if not host_clean:
+        return True
+    if host_clean in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    try:
+        return ipaddress.ip_address(host_clean).is_loopback
+    except ValueError:
+        return False
 
 
 class MistralDBError(RuntimeError):

@@ -23,35 +23,86 @@ from mistral_db import (  # type: ignore[attr-defined]
 )
 
 CLIENTS_FILE = Path(__file__).with_name("mistral_clients.json")
+LOCAL_CLIENTS_FILE = Path(__file__).with_name("mistral_clients.local.json")
 SUMMARY_PREFIX = "SUMMARY:"
 
 
 def load_profiles() -> Dict[str, Dict[str, Any]]:
     if not CLIENTS_FILE.exists():
         raise SystemExit("Липсва mistral_clients.json – няма как да се изпълни диагностиката.")
-    try:
-        with CLIENTS_FILE.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"mistral_clients.json е в невалиден формат: {exc}") from exc
 
-    profiles: Dict[str, Dict[str, Any]] = {}
-    if isinstance(data, dict):
-        for key, value in data.items():
-            if isinstance(value, dict):
-                profiles[str(key)] = value
-    elif isinstance(data, list):
-        for idx, item in enumerate(data):
-            if isinstance(item, dict):
-                name = item.get("name") or item.get("client") or item.get("label")
+    def _read(path: Path, label: str) -> Any:
+        try:
+            with path.open("r", encoding="utf-8-sig") as fh:
+                return json.load(fh)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"{label} е в невалиден формат: {exc}") from exc
+
+    def _coerce(data: Any, label: str) -> Dict[str, Dict[str, Any]]:
+        profiles_map: Dict[str, Dict[str, Any]] = {}
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if isinstance(value, dict):
+                    profiles_map[str(key)] = dict(value)
+        elif isinstance(data, list):
+            for idx, item in enumerate(data):
+                if not isinstance(item, dict):
+                    continue
+                name = (
+                    item.get("name")
+                    or item.get("client")
+                    or item.get("profile")
+                    or item.get("label")
+                )
                 if not name:
                     name = f"Профил {idx + 1}"
-                profiles[str(name)] = item
+                profiles_map[str(name)] = dict(item)
+        else:
+            raise SystemExit(f"{label} трябва да описва dict или list от профили.")
+        return profiles_map
+
+    base_profiles = _coerce(
+        _read(CLIENTS_FILE, "mistral_clients.json"),
+        "mistral_clients.json",
+    )
+
+    if LOCAL_CLIENTS_FILE.exists():
+        local_profiles = _coerce(
+            _read(LOCAL_CLIENTS_FILE, "mistral_clients.local.json"),
+            "mistral_clients.local.json",
+        )
     else:
-        raise SystemExit("mistral_clients.json трябва да описва dict или list от профили.")
+        local_profiles = {}
+
+    def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(base)
+        for key, value in override.items():
+            if (
+                key in merged
+                and isinstance(merged[key], dict)
+                and isinstance(value, dict)
+            ):
+                merged[key] = _deep_merge(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
+    profiles: Dict[str, Dict[str, Any]] = {
+        key: dict(value) for key, value in base_profiles.items()
+    }
+    for key, value in local_profiles.items():
+        if key in profiles:
+            profiles[key] = _deep_merge(profiles[key], value)
+        else:
+            profiles[key] = dict(value)
 
     if not profiles:
         raise SystemExit("В mistral_clients.json няма валидни профили.")
+
+    for value in profiles.values():
+        database_path = value.get("database")
+        if isinstance(database_path, str) and database_path:
+            value["database"] = os.path.normpath(os.fspath(database_path))
     return profiles
 
 
