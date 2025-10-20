@@ -31,20 +31,40 @@ except Exception:  # pragma: no cover - защитно
         def __init__(self) -> None:
             self._handlers: List[logging.Handler] = []
 
+        @staticmethod
+        def _format(message: Any, args: Tuple[Any, ...]) -> str:
+            text = str(message)
+            if not args:
+                return text
+            try:
+                return text.format(*args)
+            except Exception:
+                try:
+                    return text % args
+                except Exception:
+                    return text
+
+        def _emit(self, level: str, *args: Any, **kwargs: Any) -> None:
+            if not args:
+                message = ""
+            else:
+                message = self._format(args[0], tuple(args[1:]))
+            logging.log(getattr(logging, level.upper(), logging.INFO), message, **kwargs)
+
         def debug(self, *args: Any, **kwargs: Any) -> None:
-            logging.debug(*args, **kwargs)
+            self._emit("debug", *args, **kwargs)
 
         def info(self, *args: Any, **kwargs: Any) -> None:
-            logging.info(*args, **kwargs)
+            self._emit("info", *args, **kwargs)
 
         def warning(self, *args: Any, **kwargs: Any) -> None:
-            logging.warning(*args, **kwargs)
+            self._emit("warning", *args, **kwargs)
 
         def error(self, *args: Any, **kwargs: Any) -> None:
-            logging.error(*args, **kwargs)
+            self._emit("error", *args, **kwargs)
 
         def exception(self, *args: Any, **kwargs: Any) -> None:
-            logging.exception(*args, **kwargs)
+            self._emit("exception", *args, **kwargs)
 
         def bind(self, **_kwargs: Any) -> "_FauxLogger":
             return self
@@ -462,7 +482,7 @@ def _select_driver(profile: Dict[str, Any]) -> Tuple[str, Type[BaseException]]:
         candidates.append(requested)
     else:
         # Поддържаме обратно съвместимост – пробваме наличните по приоритет.
-        candidates.extend([drv for drv in ("firebird-driver", "fdb") if drv not in candidates])
+        candidates.extend([drv for drv in ("fdb", "firebird-driver") if drv not in candidates])
 
     errors: List[str] = []
     for name in candidates:
@@ -876,7 +896,7 @@ def _collect_relation_columns(cur: Any) -> Dict[str, List[str]]:
             """
         )
     except _FB_ERROR as exc:
-        _log_warning("Нямам достъп до RDB$ метаданни: %s", error=str(exc))
+        _log_warning(f"Нямам достъп до RDB$ метаданни: {exc}", error=str(exc))
         return {}
     rows = cur.fetchall() or []
     for rel_name, col_name in rows:
@@ -897,7 +917,7 @@ def _parse_schema_dump() -> Dict[str, List[str]]:
     try:
         content = schema_file.read_text(encoding="cp1251", errors="ignore")
     except Exception as exc:  # pragma: no cover - защитно
-        _log_warning("Неуспешно четене на schema dump: %s", error=str(exc))
+        _log_warning(f"Неуспешно четене на schema dump: {exc}", error=str(exc))
         return {}
 
     tables: Dict[str, List[str]] = {}
@@ -1628,8 +1648,14 @@ def connect(profile: Dict[str, Any]) -> Tuple[Any, Any]:
     _ACTIVE_DRIVER = driver_name
     _FB_ERROR = error_cls
 
-    _log_info(
-        f"Свързване към база (профил={profile_label}, драйвер={driver_name}, host={host}, port={port}, database={database}, charset={charset})"
+    logger.info(
+        "Свързване към база (профил={}, драйвер={}, host={}, port={}, database={}, charset={})",
+        profile_label,
+        driver_name,
+        host,
+        port,
+        database,
+        charset,
     )
     try:
         conn, details = _connect_raw(host, port, database, user, password, charset, driver_name)
@@ -1637,7 +1663,7 @@ def connect(profile: Dict[str, Any]) -> Tuple[Any, Any]:
     except Exception as exc:  # pragma: no cover - защитно
         _CONNECTION_INFO = {}
         logger.exception(
-            "Неуспешно свързване към база (профил: %s, драйвер: %s). host=%s, database=%s",
+            "Неуспешно свързване към база (профил: {}, драйвер: {}). host={}, database={}",
             profile_label,
             driver_name,
             host,
@@ -1669,7 +1695,7 @@ def detect_login_method(cur: Any | None = None) -> Dict[str, Any]:
 
     profile_label = _profile_label()
     cur = _require_cursor(_CONN, cur, profile_label)
-    logger.debug("Откриване на login механизъм (профил: %s).", profile_label)
+    logger.debug("Откриване на login механизъм (профил: {}).", profile_label)
 
     cur.execute(
         """
@@ -2238,7 +2264,11 @@ def db_find_by_barcode(cur: Any, barcode: str) -> List[Dict[str, Any]]:
     matches = [candidate for candidate in candidates if candidate.get("match") == "barcode"]
     if not matches:
         return []
-    logger.info("DB resolve: barcode match → %s кандидата за %s", len(matches), normalized)
+    logger.info(
+        "DB resolve: barcode match → {} кандидата за {}",
+        len(matches),
+        normalized,
+    )
     return matches
 
 
@@ -2253,7 +2283,11 @@ def db_find_by_code(cur: Any, code: str) -> List[Dict[str, Any]]:
     matches = [candidate for candidate in candidates if candidate.get("match") == "code"]
     if not matches:
         return []
-    logger.info("DB resolve: code match → %s кандидата за %s", len(matches), normalized)
+    logger.info(
+        "DB resolve: code match → {} кандидата за {}",
+        len(matches),
+        normalized,
+    )
     return matches
 
 
@@ -2274,7 +2308,7 @@ def db_find_by_name_like(cur: Any, name: str, limit: int = 5) -> List[Dict[str, 
         for candidate in candidates
     ]
     logger.info(
-        "DB resolve: name LIKE → %s кандидата за %s",
+        "DB resolve: name LIKE → {} кандидата за {}",
         len(results),
         normalized,
     )
@@ -2293,13 +2327,13 @@ def db_resolve_item(cur: Any, token: str) -> List[Dict[str, Any]]:
     candidates = resolve_item(active_cur, normalized)
     if candidates:
         logger.info(
-            "DB resolve: намерени са %s кандидата за %s",
+            "DB resolve: намерени са {} кандидата за {}",
             len(candidates),
             normalized,
         )
         return candidates
 
-    logger.info("DB resolve: no match за '%s'", normalized)
+    logger.info("DB resolve: no match за '{}'", normalized)
     return []
 
 
