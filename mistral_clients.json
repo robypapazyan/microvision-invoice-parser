@@ -1,7 +1,7 @@
 [
   {
     "name": "Local TEST",
-    "driver": "firebird-driver",
+    "driver": "fdb",
     "host": "localhost",
     "port": 3050,
     "database": "D:/base/TESTBARBERSHOP.FDB",
@@ -53,9 +53,9 @@
   },
   {
     "name": "Книжарница",
-    "host": "192.168.0.10",
+    "host": "localhost",
     "port": 3050,
-    "database": "C:/данни/Мистрал/BOOKSHOP.FDB",
+    "database": "D:\\мистрал книжарница\\PAPEX-Papex-2 (1).FDB",
     "user": "SYSDBA",
     "password": "masterkey",
     "charset": "WIN1251",
@@ -63,11 +63,11 @@
   },
   {
     "name": "Micro Vision (реална)",
-    "host": "sql.microvision.bg",
+    "host": "localhost",
     "port": 3050,
     "database": "D:/Микро Вижън/Prod/MICROVISION.FDB",
-    "user": "OPERATOR",
-    "password": "secret",
+    "user": "SYSDBA",
+    "password": "masterkey",
     "charset": "WIN1251",
     "comment": "Реална база – попълнете коректни креденшъли"
   }
