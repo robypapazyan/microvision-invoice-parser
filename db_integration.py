@@ -29,6 +29,7 @@ from mistral_db import (  # type: ignore[attr-defined]
 
 
 _CLIENTS_FILE = Path(__file__).with_name("mistral_clients.json")
+_LOCAL_CLIENTS_FILE = Path(__file__).with_name("mistral_clients.local.json")
 _PROFILE_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
 _MATERIALS_FILE = Path(__file__).with_name("materials.csv")
 _MAPPING_FILE = Path(__file__).with_name("mapping.json")
@@ -637,6 +638,63 @@ def _profile_label_from_profile(profile: Dict[str, Any], fallback: Optional[str]
     return "неизвестен"
 
 
+def _read_profiles_file(path: Path) -> Any:
+    with path.open("r", encoding="utf-8-sig") as fh:
+        return json.load(fh)
+
+
+def _coerce_profiles(data: Any, *, source: str) -> Dict[str, Dict[str, Any]]:
+    profiles: Dict[str, Dict[str, Any]] = {}
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(value, dict):
+                profiles[str(key)] = dict(value)
+    elif isinstance(data, list):
+        for idx, item in enumerate(data):
+            if not isinstance(item, dict):
+                continue
+            name = (
+                item.get("name")
+                or item.get("client")
+                or item.get("profile")
+                or item.get("label")
+            )
+            if not name:
+                name = f"Профил {idx + 1}"
+            profiles[str(name)] = dict(item)
+    else:
+        raise MistralDBError(
+            f"{source} е в неочакван формат (очаква се list или dict)."
+        )
+    return profiles
+
+
+def _deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if (
+            key in merged
+            and isinstance(merged[key], dict)
+            and isinstance(value, dict)
+        ):
+            merged[key] = _deep_merge_dict(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _merge_profile_sets(
+    base: Dict[str, Dict[str, Any]], override: Dict[str, Dict[str, Any]]
+) -> Dict[str, Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {key: dict(value) for key, value in base.items()}
+    for key, value in override.items():
+        if key in merged and isinstance(value, dict):
+            merged[key] = _deep_merge_dict(merged[key], value)
+        else:
+            merged[key] = dict(value)
+    return merged
+
+
 def _load_profiles() -> Dict[str, Dict[str, Any]]:
     global _PROFILE_CACHE
     if _PROFILE_CACHE is not None:
@@ -646,29 +704,27 @@ def _load_profiles() -> Dict[str, Dict[str, Any]]:
         raise MistralDBError("Липсва mistral_clients.json – няма как да се осъществи връзка.")
 
     try:
-        with _CLIENTS_FILE.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
+        base_data = _read_profiles_file(_CLIENTS_FILE)
     except json.JSONDecodeError as exc:  # pragma: no cover - защитно
         raise MistralDBError("mistral_clients.json съдържа невалиден JSON.") from exc
 
-    profiles: Dict[str, Dict[str, Any]] = {}
-    if isinstance(data, dict):
-        for key, value in data.items():
-            if isinstance(value, dict):
-                profiles[str(key)] = value
-    elif isinstance(data, list):
-        for idx, item in enumerate(data):
-            if not isinstance(item, dict):
-                continue
-            name = item.get("name") or item.get("client") or item.get("profile") or item.get("label")
-            if not name:
-                name = f"Профил {idx + 1}"
-            profiles[str(name)] = item
-    else:
-        raise MistralDBError("mistral_clients.json е в неочакван формат (очаква се list или dict).")
+    profiles = _coerce_profiles(base_data, source="mistral_clients.json")
+
+    if _LOCAL_CLIENTS_FILE.exists():
+        try:
+            local_data = _read_profiles_file(_LOCAL_CLIENTS_FILE)
+        except json.JSONDecodeError as exc:  # pragma: no cover - защитно
+            raise MistralDBError("mistral_clients.local.json съдържа невалиден JSON.") from exc
+        local_profiles = _coerce_profiles(local_data, source="mistral_clients.local.json")
+        profiles = _merge_profile_sets(profiles, local_profiles)
 
     if not profiles:
         raise MistralDBError("В mistral_clients.json няма валидно описани профили.")
+
+    for value in profiles.values():
+        database_path = value.get("database")
+        if isinstance(database_path, str) and database_path:
+            value["database"] = os.path.normpath(os.fspath(database_path))
 
     _PROFILE_CACHE = profiles
     return profiles
