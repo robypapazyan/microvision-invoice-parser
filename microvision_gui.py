@@ -52,7 +52,10 @@ def ensure_clients_file(path: str = CLIENTS_JSON) -> None:
             "Създаден е примерен mistral_clients.json. Попълнете реални параметри преди работа."
         )
     except Exception as exc:
-        logger.exception("Неуспешно създаване на примерен mistral_clients.json: %s", exc)
+        logger.exception(
+            "Неуспешно създаване на примерен mistral_clients.json: {}",
+            exc,
+        )
 
 
 def _check_runtime_dependencies() -> None:
@@ -75,7 +78,8 @@ def _check_runtime_dependencies() -> None:
             continue
     if missing:
         logger.warning(
-            "Липсващи зависимости: %s", ", ".join(sorted(set(missing)))
+            "Липсващи зависимости: {}",
+            ", ".join(sorted(set(missing))),
         )
 
 
@@ -183,10 +187,10 @@ def load_profiles(path: str = CLIENTS_JSON) -> Dict[str, Dict[str, Any]]:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except FileNotFoundError:
-        logger.exception("Файлът %s липсва.", path)
+        logger.exception("Файлът {} липсва.", path)
         return {}
     except Exception as exc:  # pragma: no cover
-        logger.exception("Неуспешно зареждане на профилите: %s", exc)
+        logger.exception("Неуспешно зареждане на профилите: {}", exc)
         return {}
 
     profiles: Dict[str, Dict[str, Any]] = {}
@@ -201,7 +205,7 @@ def load_profiles(path: str = CLIENTS_JSON) -> Dict[str, Dict[str, Any]]:
             name = str(item.get("name") or item.get("client") or f"Профил {idx + 1}")
             profiles[name] = item
     else:
-        logger.error("Неочакван формат на %s. Очаква се dict или list.", path)
+        logger.error("Неочакван формат на {}. Очаква се dict или list.", path)
         return {}
 
     return profiles
@@ -221,7 +225,7 @@ class MicroVisionApp:
             try:
                 self.root.iconbitmap(icon_path)
             except Exception:  # pragma: no cover - iconbitmap не работи на някои платформи
-                logger.debug("Неуспешно зареждане на икона от %s", icon_path)
+                logger.debug("Неуспешно зареждане на икона от {}", icon_path)
 
         self.session = SessionState()
         self.session.ui_root = self.root
@@ -248,7 +252,7 @@ class MicroVisionApp:
             initial_profile_label = self.active_profile_name or self.profile_names[0]
         else:
             self._log("⚠️ Няма профили в mistral_clients.json.")
-        logger.info("Приложението е стартирано. Профил: %s", initial_profile_label)
+        logger.info("Приложението е стартирано. Профил: {}", initial_profile_label)
 
         self._refresh_license_text()
         self.root.after(150, self.password_entry.focus_set)
@@ -347,7 +351,7 @@ class MicroVisionApp:
             else:
                 subprocess.Popen(["xdg-open", str(log_dir)])
         except Exception as exc:
-            logger.exception("Неуспешно отваряне на директорията с логове: %s", exc)
+            logger.exception("Неуспешно отваряне на директорията с логове: {}", exc)
             messagebox.showerror(
                 "Логове",
                 f"Неуспешно отваряне на {log_dir}.\n{exc}",
@@ -401,7 +405,7 @@ class MicroVisionApp:
 
         self._log("🔎 Стартирам диагностика на входа…")
         logger.info(
-            "Стартирана е диагностика (профил: %s, потребител: %s)",
+            "Стартирана е диагностика (профил: {}, потребител: {})",
             profile_name,
             username or "<само парола>",
         )
@@ -953,7 +957,7 @@ class MicroVisionApp:
         except ImportError:
             validator = None
         except Exception as exc:  # pragma: no cover - защитно
-            logger.warning("Неуспешно зареждане на license_utils: %s", exc)
+            logger.warning("Неуспешно зареждане на license_utils: {}", exc)
             validator = None
 
         if validator is not None:
@@ -963,7 +967,7 @@ class MicroVisionApp:
                 except TypeError:
                     validation_result = validator()
             except Exception as exc:
-                logger.exception("Грешка при validate_license: %s", exc)
+                logger.exception("Грешка при validate_license: {}", exc)
                 self.license_var.set("Лиценз: проверка недостъпна")
                 return
 
@@ -1002,18 +1006,21 @@ class MicroVisionApp:
             if valid_flag is False:
                 self.license_var.set("Лиценз: изтекъл")
                 return
-            logger.warning("validate_license върна неочаквани данни: %r", validation_result)
+            logger.warning(
+                "validate_license върна неочаквани данни: {!r}",
+                validation_result,
+            )
 
         if not license_file.exists():
             self.license_var.set("Лиценз: проверка недостъпна")
-            logger.warning("Лиценз файлът липсва: %s", license_file)
+            logger.warning("Лиценз файлът липсва: {}", license_file)
             return
 
         try:
             with license_file.open("r", encoding="utf-8") as fh:
                 data = json.load(fh)
         except Exception as exc:
-            logger.exception("Грешка при прочитане на лиценз файла: %s", exc)
+            logger.exception("Грешка при прочитане на лиценз файла: {}", exc)
             self.license_var.set("Лиценз: проверка недостъпна")
             return
 

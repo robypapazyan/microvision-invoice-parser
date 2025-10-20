@@ -4,13 +4,15 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from mistral_db import (  # type: ignore[attr-defined]
     MistralDBError,
-    Material,
     _require_cursor,
     connect,
     create_open_delivery,
@@ -41,19 +43,92 @@ _MATERIALS_BY_BARCODE: Optional[Dict[str, Dict[str, Any]]] = None
 _MAPPING_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
 
 
+@dataclass
+class Item:
+    code: str
+    name: str
+    barcode: Optional[str] = None
+    score: Optional[int] = None
+
+
 def _log_to_output(session: Any, message: str) -> None:
     log_fn = getattr(session, "output_logger", None)
     if callable(log_fn):
         try:
             log_fn(message)
         except Exception:
-            logger.debug("Неуспешно записване в изходния прозорец: %s", message)
+            logger.debug("Неуспешно записване в изходния прозорец: {}", message)
+
+
+def _normalize_search_text(value: str) -> str:
+    if not value:
+        return ""
+    cleaned = value.upper().translate({
+        0x2013: "-",
+        0x2014: "-",
+        0x2010: "-",
+    })
+    allowed_chars = []
+    for ch in cleaned:
+        if ch.isalnum() or ch in {" ", "-"}:
+            allowed_chars.append(ch)
+        else:
+            allowed_chars.append(" ")
+    normalized = " ".join("".join(allowed_chars).split())
+    return normalized
+
+
+def _fuzzy_score(query: str, candidate: str) -> int:
+    lhs = _normalize_search_text(query)
+    rhs = _normalize_search_text(candidate)
+    if not lhs or not rhs:
+        return 0
+    return int(round(SequenceMatcher(None, lhs, rhs).ratio() * 100))
 
 
 def _normalize_token(value: str | None) -> str:
     value = value or ""
     collapsed = " ".join(value.split())
     return collapsed.lower()
+
+
+def db_find_by_barcode(cur: Any, code: str) -> Optional[Item]:
+    if not code:
+        return None
+    cur.execute(
+        """
+        SELECT FIRST 1 m.MATERIALCODE, m.MATERIAL
+        FROM BARCODE b
+        JOIN MATERIAL m ON m.MATERIALCODE = b.FK_STORAGEMATERIALCODE
+        WHERE b.CODE = ?
+        """,
+        (code,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    return Item(code=str(row[0]), name=str(row[1] or ""), barcode=code)
+
+
+def db_find_by_name(cur: Any, text: str, limit: int = 10) -> List[Item]:
+    normalized = _normalize_search_text(text)
+    if not normalized:
+        return []
+    tokens = normalized.split()
+    if not tokens:
+        return []
+    conditions = ["UPPER(m.MATERIAL) CONTAINING ?"]
+    params: List[Any] = [tokens[0]]
+    for token in tokens[1:]:
+        conditions.append("UPPER(m.MATERIAL) LIKE ?")
+        params.append(f"%{token}%")
+    query = (
+        "SELECT FIRST {} m.MATERIALCODE, m.MATERIAL FROM MATERIAL m WHERE "
+        + " AND ".join(conditions)
+    ).format(int(limit))
+    cur.execute(query, tuple(params))
+    items = [Item(code=str(row[0]), name=str(row[1] or "")) for row in cur.fetchall()]
+    return items
 
 
 def _ensure_decimal(value: Any, default: Decimal) -> Decimal:
@@ -102,7 +177,7 @@ def _load_materials() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, An
                 if barcode:
                     materials_by_barcode[barcode] = material
     except Exception as exc:
-        logger.warning("Неуспешно зареждане на materials.csv: %s", exc)
+        logger.warning("Неуспешно зареждане на materials.csv: {}", exc)
 
     _MATERIALS_CACHE = materials
     _MATERIALS_BY_BARCODE = materials_by_barcode
@@ -129,7 +204,7 @@ def _load_mapping() -> Dict[str, Dict[str, Any]]:
                     continue
                 mapping[_normalize_token(str(key))] = value
     except Exception as exc:
-        logger.warning("Неуспешно зареждане на mapping.json: %s", exc)
+        logger.warning("Неуспешно зареждане на mapping.json: {}", exc)
 
     _MAPPING_CACHE = mapping
     return mapping
@@ -181,51 +256,56 @@ def _fallback_from_material(code: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def _fallback_match(row: Dict[str, Any], token: str) -> Optional[Dict[str, Any]]:
+def _mapping_candidate(token: str) -> Optional[Dict[str, Any]]:
     token_norm = _normalize_token(token)
     if not token_norm:
         return None
 
-    materials, materials_by_barcode = _load_materials()
-    if token in materials_by_barcode:
-        candidate = materials_by_barcode[token]
-        return {
-            "id": None,
-            "code": candidate.get("code"),
-            "name": candidate.get("name"),
-            "barcode": candidate.get("barcode"),
-            "source": "mapping",
-            "match": "barcode",
-            "purchase_price": candidate.get("purchase_price"),
-            "sale_price": candidate.get("sale_price"),
-        }
-
     mapping = _load_mapping()
     entry = mapping.get(token_norm)
-    if entry and isinstance(entry, dict):
-        mapped_code = str(entry.get("code") or "").strip()
-        mapped_name = str(entry.get("name") or "").strip()
-        candidate = _fallback_from_material(mapped_code)
-        if candidate:
-            candidate["name"] = candidate.get("name") or mapped_name
-            candidate["match"] = candidate.get("match") or "mapping"
-            return candidate
-        if mapped_code:
-            return {
-                "id": None,
-                "code": mapped_code,
-                "name": mapped_name,
-                "barcode": None,
-                "source": "mapping",
-                "match": "mapping",
-            }
+    if not entry or not isinstance(entry, dict):
+        return None
 
+    mapped_code = str(entry.get("code") or "").strip()
+    mapped_name = str(entry.get("name") or "").strip()
+    candidate = _fallback_from_material(mapped_code) if mapped_code else None
+    if candidate:
+        candidate["name"] = candidate.get("name") or mapped_name
+        candidate["match"] = candidate.get("match") or "mapping"
+        return candidate
+    if mapped_code:
+        return {
+            "id": None,
+            "code": mapped_code,
+            "name": mapped_name,
+            "barcode": None,
+            "source": "mapping",
+            "match": "mapping",
+        }
+    return None
+
+
+def _materials_candidate(token: str) -> Optional[Dict[str, Any]]:
+    if not token:
+        return None
+    materials, materials_by_barcode = _load_materials()
+    direct = materials_by_barcode.get(token)
+    if direct:
+        return {
+            "id": None,
+            "code": direct.get("code"),
+            "name": direct.get("name"),
+            "barcode": direct.get("barcode"),
+            "source": "mapping",
+            "match": "barcode",
+            "purchase_price": direct.get("purchase_price"),
+            "sale_price": direct.get("sale_price"),
+        }
     if token in materials:
         candidate = _fallback_from_material(token)
         if candidate:
             candidate["match"] = candidate.get("match") or "code"
         return candidate
-
     return None
 
 
@@ -386,13 +466,13 @@ def _choose_candidate_dialog(
     return result.get("value")
 
 
-def _material_to_candidate(material: Material, match: str) -> Dict[str, Any]:
+def _item_to_candidate(item: Item, match: str) -> Dict[str, Any]:
     return {
         "id": None,
-        "code": material.code,
-        "name": material.name,
-        "barcode": material.barcode,
-        "storage_code": material.storage_code,
+        "code": item.code,
+        "name": item.name,
+        "barcode": item.barcode,
+        "storage_code": None,
         "source": "db",
         "match": match,
     }
@@ -416,7 +496,7 @@ def resolve_items_from_db(session: Any, rows: List[Dict[str, Any]]) -> List[Dict
         try:
             detect_catalog_schema(cur)
         except MistralDBError as exc:
-            logger.warning("Каталогът не може да бъде детектиран: %s", exc)
+            logger.warning("Каталогът не може да бъде детектиран: {}", exc)
             cur = None
             use_db = False
 
@@ -445,48 +525,70 @@ def resolve_items_from_db(session: Any, rows: List[Dict[str, Any]]) -> List[Dict
         working["resolved"] = None
         working["final_item"] = None
 
+        mapping_candidate = _mapping_candidate(token)
+        if mapping_candidate:
+            apply_candidate_choice(
+                working,
+                mapping_candidate,
+                mapping_candidate.get("source", "mapping"),
+            )
+            stats["mapping"] += 1
+            logger.info(
+                "DB resolve: mapping → token={} → код={}",
+                token,
+                working["final_item"].get("code"),
+            )
+            resolved_rows.append(working)
+            continue
+
         candidate: Optional[Dict[str, Any]] = None
-        multi_candidates: List[Dict[str, Any]] = []
+        if use_db and cur is not None:
+            numeric_candidates = []
+            for value in (barcode, token, name):
+                if not value:
+                    continue
+                digits = re.sub(r"\D", "", str(value))
+                if 8 <= len(digits) <= 14:
+                    numeric_candidates.append(digits)
+            digits_seen = next(iter(numeric_candidates), None)
+            if digits_seen:
+                try:
+                    item = db_find_by_barcode(cur, digits_seen)
+                except Exception as exc:  # pragma: no cover - защитно
+                    logger.error("Грешка при търсене на баркод {}: {}", digits_seen, exc)
+                else:
+                    if item:
+                        candidate = _item_to_candidate(item, "barcode")
 
-        if use_db and cur is not None and barcode:
-            try:
-                material = get_material_by_barcode(cur, str(barcode))
-            except MistralDBError as exc:
-                logger.error("Грешка при търсене на баркод '%s': %s", barcode, exc)
-            else:
-                if material:
-                    candidate = _material_to_candidate(material, "barcode")
-
-        if use_db and cur is not None and candidate is None and name:
-            try:
-                materials = find_material_candidates(cur, str(name))
-            except MistralDBError as exc:
-                logger.error("Грешка при търсене по име '%s': %s", name, exc)
-                materials = []
-            if len(materials) == 1:
-                candidate = _material_to_candidate(materials[0], "name")
-            elif len(materials) > 1:
-                multi_candidates = [
-                    _material_to_candidate(material, "name") for material in materials
-                ]
+            if candidate is None:
+                search_text = name or token
+                if search_text:
+                    try:
+                        items = db_find_by_name(cur, str(search_text))
+                    except Exception as exc:  # pragma: no cover - защитно
+                        logger.error("Грешка при търсене по име {}: {}", search_text, exc)
+                    else:
+                        best_item: Optional[Item] = None
+                        best_score = 0
+                        for item in items:
+                            score = _fuzzy_score(str(search_text), item.name)
+                            if score > best_score:
+                                best_score = score
+                                best_item = item
+                        if best_item and best_score >= 82:
+                            candidate = _item_to_candidate(best_item, "name")
+                            candidate["score"] = best_score
 
         if candidate:
             apply_candidate_choice(working, candidate, candidate.get("source", "db"))
             stats["db"] += 1
             logger.info(
-                "DB resolve: съвпадение (%s) → код=%s",
+                "DB resolve: съвпадение ({}) → код={}",
                 candidate.get("match"),
                 working["final_item"].get("code"),
             )
-        elif multi_candidates:
-            working["resolved"] = {"candidates": multi_candidates, "token": name}
-            stats["multi"] += 1
-            logger.info(
-                "DB resolve: %s кандидата по име → изисква се избор",
-                len(multi_candidates),
-            )
         else:
-            fallback_candidate = _fallback_match(working, token)
+            fallback_candidate = _materials_candidate(token)
             if fallback_candidate:
                 apply_candidate_choice(
                     working,
@@ -495,7 +597,7 @@ def resolve_items_from_db(session: Any, rows: List[Dict[str, Any]]) -> List[Dict
                 )
                 stats["mapping"] += 1
                 logger.info(
-                    "DB resolve: fallback mapping → token=%s → код=%s",
+                    "DB resolve: fallback materials → token={} → код={}",
                     token,
                     working["final_item"].get("code"),
                 )
@@ -504,7 +606,7 @@ def resolve_items_from_db(session: Any, rows: List[Dict[str, Any]]) -> List[Dict
                 working["final_item"] = None
                 stats["unresolved"] += 1
                 message = token or name or code or barcode or "(без стойност)"
-                logger.info("DB resolve: no match → unresolved → token=%s", message)
+                logger.info("DB resolve: no match → unresolved → token={}", message)
                 unresolved_entries.append(
                     {
                         "token": token or "",
@@ -783,7 +885,7 @@ def _resolve_profile(session: Any) -> Tuple[str, Dict[str, Any]]:
 
 def initialize_session(session: Any, profile_key: str) -> Tuple[Any, Any]:
     profile = _load_profile(profile_key)
-    logger.info("Инициализация на сесия за профил: %s", profile_key)
+    logger.info("Инициализация на сесия за профил: {}", profile_key)
     conn, cur = connect(profile)
     session.conn = conn
     session.cur = cur
@@ -793,7 +895,7 @@ def initialize_session(session: Any, profile_key: str) -> Tuple[Any, Any]:
         session.connection_info = get_connection_info()
     except Exception:
         session.connection_info = {}
-    logger.info("Успешно свързване за профил: %s", profile_key)
+    logger.info("Успешно свързване за профил: {}", profile_key)
     return conn, cur
 
 
@@ -803,12 +905,13 @@ def _ensure_connection(session: Any, profile_label: str, profile: Dict[str, Any]
     if conn is not None and cur is not None:
         try:
             _require_cursor(conn, cur, profile_label)
-            logger.debug("Използваме съществуваща връзка за профил: %s", profile_label)
-            return conn, cur
         except MistralDBError:
             pass
+        else:
+            logger.debug("Използваме съществуваща връзка за профил: {}", profile_label)
+            return conn, cur
 
-    logger.info("Повторно свързване към профил: %s", profile_label)
+    logger.info("Повторно свързване към профил: {}", profile_label)
     conn, cur = connect(profile)
     session.conn = conn
     session.cur = cur
@@ -828,13 +931,13 @@ def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
         profile_label, profile = _resolve_profile(session)
         _ensure_connection(session, profile_label, profile)
     except MistralDBError as exc:
-        logger.error("Грешка при подготовка за логин: %s", exc)
+        logger.error("Грешка при подготовка за логин: {}", exc)
         trace = get_last_login_trace()
         session.last_login_trace = trace
         return {"error": str(exc), "trace": trace}
 
     logger.info(
-        "Опит за логин (профил: %s, потребител: %s)",
+        "Опит за логин (профил: {}, потребител: {})",
         profile_label,
         username or "<само парола>",
     )
@@ -843,7 +946,7 @@ def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
     except MistralDBError as exc:
         message = str(exc)
         logger.warning(
-            "Логинът беше неуспешен (профил: %s, потребител: %s): %s",
+            "Логинът беше неуспешен (профил: {}, потребител: {}): {}",
             profile_label,
             username or "<само парола>",
             message,
@@ -854,7 +957,7 @@ def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
                 operator_id, operator_login = login_user(username, password)
             except MistralDBError as retry_exc:
                 logger.error(
-                    "Повторният опит за логин се провали (профил: %s): %s",
+                    "Повторният опит за логин се провали (профил: {}): {}",
                     profile_label,
                     retry_exc,
                 )
@@ -868,7 +971,7 @@ def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
 
     session.profile_label = profile_label
     logger.info(
-        "Успешен логин (профил: %s, потребител: %s, оператор ID: %s)",
+        "Успешен логин (профил: {}, потребител: {}, оператор ID: {})",
         profile_label,
         operator_login,
         operator_id,
@@ -890,7 +993,7 @@ def start_open_delivery(session: Any) -> int:
     delivery_id = create_open_delivery(int(operator_id))
     session.open_delivery_id = delivery_id
     logger.info(
-        "Създадена е OPEN доставка (профил: %s, оператор ID: %s, доставка ID: %s)",
+        "Създадена е OPEN доставка (профил: {}, оператор ID: {}, доставка ID: {})",
         profile_label,
         operator_id,
         delivery_id,
@@ -989,7 +1092,7 @@ def push_parsed_rows(session: Any, rows: List[Dict[str, Any]]) -> None:
             row["resolved"] = None
             row["final_item"] = None
             unresolved += 1
-            logger.info("Редът остана нерезолвиран (token=%s).", token or "<празно>")
+            logger.info("Редът остана нерезолвиран (token={}).", token or "<празно>")
             continue
 
         candidate_payload = dict(candidate)
@@ -1019,7 +1122,7 @@ def push_parsed_rows(session: Any, rows: List[Dict[str, Any]]) -> None:
 
     operator_id = getattr(session, "user_id", None)
     logger.info(
-        "Изпратени са артикули към Мистрал (профил: %s, оператор ID: %s, доставка ID: %s, редове: %s, нерешени: %s, ръчни избори: %s)",
+        "Изпратени са артикули към Мистрал (профил: {}, оператор ID: {}, доставка ID: {}, редове: {}, нерешени: {}, ръчни избори: {})",
         profile_label,
         operator_id,
         delivery_id,
