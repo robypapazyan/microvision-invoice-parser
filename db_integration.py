@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, TypedDict
 
 from mistral_db import (  # type: ignore[attr-defined]
     MistralDBError,
@@ -51,6 +51,9 @@ class Item:
     score: Optional[int] = None
 
 
+ItemHit = TypedDict("ItemHit", {"code": str, "name": str})
+
+
 def _log_to_output(session: Any, message: str) -> None:
     log_fn = getattr(session, "output_logger", None)
     if callable(log_fn):
@@ -90,6 +93,213 @@ def _normalize_token(value: str | None) -> str:
     value = value or ""
     collapsed = " ".join(value.split())
     return collapsed.lower()
+
+
+class Mapping:
+    """Управлява локалните съответствия между доставчици и материали."""
+
+    def __init__(self, path: Optional[Path] = None) -> None:
+        self.path = Path(path or _MAPPING_FILE)
+        self._data: Dict[str, Any] = {"suppliers": {}}
+        self._dirty = False
+        self._load()
+
+    # -------------------------
+    # Нормализация
+    # -------------------------
+    @staticmethod
+    def normalize_text(value: str) -> str:
+        collapsed = " ".join((value or "").strip().split())
+        return collapsed.upper()
+
+    @staticmethod
+    def _normalize_supplier(value: Any) -> str:
+        if value in (None, ""):
+            return "DEFAULT"
+        return str(value).strip() or "DEFAULT"
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(
+                json.dumps({"suppliers": {}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            self._data = {"suppliers": {}}
+            self._dirty = False
+            return
+
+        try:
+            with self.path.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except Exception as exc:
+            logger.error("Неуспешно зареждане на mapping.json: {}", exc)
+            payload = {"suppliers": {}}
+
+        suppliers_payload = payload.get("suppliers") if isinstance(payload, dict) else None
+        if not isinstance(suppliers_payload, dict):
+            # Легаси формат – прехвърляме в DEFAULT доставчик.
+            legacy: Dict[str, Any] = payload if isinstance(payload, dict) else {}
+            default_map: Dict[str, str] = {}
+            for key, value in legacy.items():
+                if not isinstance(value, dict):
+                    continue
+                code = str(value.get("code") or "").strip()
+                if not code:
+                    continue
+                normalized = self.normalize_text(str(key))
+                default_map[normalized] = code
+            suppliers_payload = {
+                "DEFAULT": {"by_barcode": {}, "by_text": default_map}
+            }
+            self._dirty = True
+
+        suppliers: Dict[str, Dict[str, Dict[str, str]]] = {}
+        for supplier_key, entry in (suppliers_payload or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            barcode_map = entry.get("by_barcode")
+            text_map = entry.get("by_text")
+            suppliers[str(supplier_key)] = {
+                "by_barcode": dict(barcode_map) if isinstance(barcode_map, dict) else {},
+                "by_text": dict(text_map) if isinstance(text_map, dict) else {},
+            }
+
+        self._data = {"suppliers": suppliers}
+        if self._dirty:
+            self._save()
+        else:
+            self._dirty = False
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("w", encoding="utf-8") as fh:
+            json.dump(self._data, fh, ensure_ascii=False, indent=2)
+        self._dirty = False
+
+    def _ensure_supplier(self, supplier: str) -> Dict[str, Dict[str, str]]:
+        suppliers = self._data.setdefault("suppliers", {})
+        if supplier not in suppliers:
+            suppliers[supplier] = {"by_barcode": {}, "by_text": {}}
+            self._dirty = True
+        return suppliers[supplier]
+
+    # -------------------------
+    # Публичен API
+    # -------------------------
+    def get_mapped_barcode(self, supplier: Any, barcode: str) -> Optional[str]:
+        supplier_key = self._normalize_supplier(supplier)
+        entry = self._data.get("suppliers", {}).get(supplier_key) or {}
+        if not barcode:
+            return None
+        return (entry.get("by_barcode") or {}).get(barcode)
+
+    def set_mapped_barcode(self, supplier: Any, barcode: str, materialcode: str) -> None:
+        if not barcode or not materialcode:
+            return
+        supplier_key = self._normalize_supplier(supplier)
+        entry = self._ensure_supplier(supplier_key)
+        entry.setdefault("by_barcode", {})[barcode] = materialcode
+        self._dirty = True
+        self._save()
+        logger.info(
+            "Записан е mapping-barcode (доставчик={}, баркод={}, материал={})",
+            supplier_key,
+            barcode,
+            materialcode,
+        )
+
+    def get_mapped_text(self, supplier: Any, text: str) -> Optional[str]:
+        supplier_key = self._normalize_supplier(supplier)
+        entry = self._data.get("suppliers", {}).get(supplier_key) or {}
+        normalized = self.normalize_text(text)
+        return (entry.get("by_text") or {}).get(normalized)
+
+    def set_mapped_text(self, supplier: Any, text: str, materialcode: str) -> None:
+        if not text or not materialcode:
+            return
+        supplier_key = self._normalize_supplier(supplier)
+        entry = self._ensure_supplier(supplier_key)
+        normalized = self.normalize_text(text)
+        entry.setdefault("by_text", {})[normalized] = materialcode
+        self._dirty = True
+        self._save()
+        logger.info(
+            "Записан е mapping-text (доставчик={}, текст='{}', материал={})",
+            supplier_key,
+            normalized,
+            materialcode,
+        )
+
+
+class DbItemResolver:
+    """Предоставя заявки към каталога на Мистрал."""
+
+    def __init__(self, cursor: Any) -> None:
+        self._cur = cursor
+        schema = detect_catalog_schema(cursor)
+        self.catalog = {
+            "materials_table": schema.get("materials_table"),
+            "barcode_table": schema.get("barcode_table"),
+            "code_col": schema.get("code_col"),
+            "fk_col": schema.get("fk_col"),
+            "code_name_col": schema.get("code_name_col"),
+            "code_id_col": schema.get("code_id_col"),
+        }
+        self._materials_table = schema.get("materials_table") or "MATERIAL"
+        self._barcode_table = schema.get("barcode_table") or "BARCODE"
+        self._barcode_code_col = schema.get("code_col") or "CODE"
+        self._barcode_fk_col = schema.get("fk_col") or "FK_STORAGEMATERIALCODE"
+        self._material_code_col = schema.get("code_id_col") or "MATERIALCODE"
+        self._material_name_col = schema.get("code_name_col") or "MATERIAL"
+
+    def resolve_by_barcode(self, barcode: str) -> Optional[ItemHit]:
+        value = (barcode or "").strip()
+        if not value:
+            return None
+        sql = (
+            f"SELECT FIRST 1 m.{self._material_code_col}, m.{self._material_name_col} "
+            f"FROM {self._materials_table} m "
+            f"JOIN {self._barcode_table} b ON b.{self._barcode_fk_col} = m.{self._material_code_col} "
+            f"WHERE b.{self._barcode_code_col} = ?"
+        )
+        self._cur.execute(sql, (value,))
+        row = self._cur.fetchone()
+        if not row:
+            return None
+        return ItemHit(code=str(row[0]), name=str(row[1] or ""))
+
+    def resolve_by_name(self, fragment: str, limit: int = 20) -> List[ItemHit]:
+        pattern = (fragment or "").strip()
+        if not pattern:
+            return []
+        sql = (
+            f"SELECT FIRST {int(limit)} m.{self._material_code_col}, m.{self._material_name_col} "
+            f"FROM {self._materials_table} m "
+            f"WHERE UPPER(m.{self._material_name_col}) LIKE UPPER(?) "
+            f"ORDER BY m.{self._material_name_col}"
+        )
+        self._cur.execute(sql, (f"%{pattern}%",))
+        rows = self._cur.fetchall() or []
+        results: List[ItemHit] = []
+        for row in rows:
+            results.append(ItemHit(code=str(row[0]), name=str(row[1] or "")))
+        return results
+
+    def ensure_item(self, code: str) -> Optional[ItemHit]:
+        value = (code or "").strip()
+        if not value:
+            return None
+        sql = (
+            f"SELECT m.{self._material_code_col}, m.{self._material_name_col} "
+            f"FROM {self._materials_table} m "
+            f"WHERE m.{self._material_code_col} = ?"
+        )
+        self._cur.execute(sql, (value,))
+        row = self._cur.fetchone()
+        if not row:
+            return None
+        return ItemHit(code=str(row[0]), name=str(row[1] or ""))
 
 
 def db_find_by_barcode(cur: Any, code: str) -> Optional[Item]:
@@ -895,6 +1105,14 @@ def initialize_session(session: Any, profile_key: str) -> Tuple[Any, Any]:
         session.connection_info = get_connection_info()
     except Exception:
         session.connection_info = {}
+    try:
+        resolver = DbItemResolver(cur)
+        session.catalog = resolver.catalog
+    except MistralDBError as exc:
+        logger.warning("Каталожната схема не може да бъде заредена: {}", exc)
+        session.catalog = {}
+    except Exception:
+        session.catalog = {}
     logger.info("Успешно свързване за профил: {}", profile_key)
     return conn, cur
 
@@ -921,6 +1139,13 @@ def _ensure_connection(session: Any, profile_label: str, profile: Dict[str, Any]
         session.connection_info = get_connection_info()
     except Exception:
         session.connection_info = {}
+    try:
+        resolver = DbItemResolver(cur)
+        session.catalog = resolver.catalog
+    except MistralDBError:
+        session.catalog = {}
+    except Exception:
+        session.catalog = {}
     return conn, cur
 
 
