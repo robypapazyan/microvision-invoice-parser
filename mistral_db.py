@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple, runtime_checkable
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple, Type, runtime_checkable
 
 import re
 
@@ -164,13 +164,6 @@ _configure_logging()
 
 
 try:  # pragma: no cover - import guard
-    from firebird.driver import Error as _FirebirdDriverError  # type: ignore
-    from firebird.driver import connect as _firebird_connect  # type: ignore
-except ImportError:  # pragma: no cover - може да липсва
-    _FirebirdDriverError = None  # type: ignore
-    _firebird_connect = None  # type: ignore
-
-try:  # pragma: no cover - import guard
     import fdb  # type: ignore
 except ImportError:  # pragma: no cover - може да липсва
     fdb = None  # type: ignore
@@ -203,6 +196,7 @@ class _BaseFbClient:
 
     def __init__(self) -> None:
         self._conn: Any | None = None
+        self._info: Dict[str, Any] = {}
 
     def connect(
         self,
@@ -258,6 +252,9 @@ class _BaseFbClient:
             raise AttributeError(item)
         return getattr(self._conn, item)
 
+    def connection_details(self) -> Dict[str, Any]:
+        return dict(self._info)
+
 
 class FirebirdDriverClient(_BaseFbClient):
     """Адаптер за официалния firebird-driver."""
@@ -271,23 +268,46 @@ class FirebirdDriverClient(_BaseFbClient):
         password: str,
         charset: str,
     ) -> "FirebirdDriverClient":
-        if _firebird_connect is None:
-            raise ImportError("firebird-driver не е наличен")
+        try:
+            from firebird.driver import connect as fbdrv_connect  # type: ignore
+        except ImportError as exc:  # pragma: no cover - защитно
+            raise ImportError("firebird-driver не е наличен") from exc
+
         database_path = _normalize_database_path(database)
         host_clean = str(host or "").strip()
-        dsn: str
-        if host_clean and not _is_loopback_host(host_clean):
-            port_fragment = f"/{int(port)}" if int(port) else ""
-            dsn = f"{host_clean}{port_fragment}:{database_path}"
-        else:
-            dsn = database_path
-        _log_info("Използва се firebird-driver", driver="firebird-driver", dsn=dsn, charset=charset)
-        self._conn = _firebird_connect(  # type: ignore[misc]
-            dsn=dsn,
-            user=user,
-            password=password,
-            charset=charset,
+        port_value = int(port) if port else 0
+        dsn = f"{host_clean}/{port_value}:{database_path}" if host_clean else database_path
+        self._info = {
+            "driver": "firebird-driver",
+            "function": "firebird.driver.connect",
+            "dsn": dsn,
+            "host": host_clean,
+            "port": port_value,
+            "database": database_path,
+            "user": user,
+            "charset": charset,
+        }
+        _log_info(
+            f"Използва се firebird-driver (dsn={dsn}, charset={charset})"
         )
+        trace_payload = dict(self._info)
+        _trace("connect_attempt", **trace_payload, password=password)
+        try:
+            self._conn = fbdrv_connect(
+                dsn=dsn,
+                user=user,
+                password=password,
+                charset=charset,
+            )
+        except Exception as exc:
+            failure_payload = _exception_trace_payload(trace_payload, exc)
+            _trace("connect_failure", **failure_payload)
+            _log_error(
+                f"firebird.driver.connect(dsn={dsn}, user={user}, charset={charset}) → {exc}"
+            )
+            raise
+        else:
+            _trace("connect_success", **trace_payload)
         return self
 
 
@@ -306,32 +326,52 @@ class FdbClient(_BaseFbClient):
         if fdb is None:
             raise ImportError("fdb не е наличен")
         database_path = _normalize_database_path(database)
-        _log_info("Използва се fdb драйвер", driver="fdb", database=database_path, charset=charset)
-        self._conn = fdb.connect(  # type: ignore[arg-type]
-            host=host,
-            port=port,
-            database=database_path,
-            user=user,
-            password=password,
-            charset=charset,
+        host_clean = str(host or "").strip()
+        port_value = int(port) if port else 0
+        self._info = {
+            "driver": "fdb",
+            "function": "fdb.connect",
+            "dsn": None,
+            "host": host_clean,
+            "port": port_value,
+            "database": database_path,
+            "user": user,
+            "charset": charset,
+        }
+        _log_info(
+            f"Използва се fdb драйвер (host={host_clean}, port={port_value}, database={database_path}, charset={charset})"
         )
+        trace_payload = dict(self._info)
+        _trace("connect_attempt", **trace_payload, password=password)
+        try:
+            self._conn = fdb.connect(  # type: ignore[arg-type]
+                host=host,
+                port=port,
+                database=database_path,
+                user=user,
+                password=password,
+                charset=charset,
+            )
+        except Exception as exc:
+            failure_payload = _exception_trace_payload(trace_payload, exc)
+            _trace("connect_failure", **failure_payload)
+            _log_error(
+                f"fdb.connect(host={host_clean}, port={port_value}, database={database_path}, user={user}, charset={charset}) → {exc}"
+            )
+            raise
+        else:
+            _trace("connect_success", **trace_payload)
         return self
 
 
-_FB_CLIENT_CLASS: type[_BaseFbClient]
+_DRIVER_CLIENTS: Dict[str, type[_BaseFbClient]] = {
+    "firebird-driver": FirebirdDriverClient,
+    "fdb": FdbClient,
+}
 
-if _firebird_connect is not None:
-    _FB_API = "firebird-driver"
-    _FB_ERROR = _FirebirdDriverError or Exception  # type: ignore[assignment]
-    _FB_CLIENT_CLASS = FirebirdDriverClient
-elif fdb is not None:
-    _FB_API = "fdb"
-    _FB_ERROR = fdb.DatabaseError  # type: ignore[attr-defined]
-    _FB_CLIENT_CLASS = FdbClient
-else:  # pragma: no cover - защитно
-    raise ImportError(
-        "Не е открит Firebird драйвер. Инсталирайте 'firebird-driver' или 'fdb'."
-    )
+_ACTIVE_DRIVER = ""
+_FB_ERROR: Type[BaseException] = Exception
+_CONNECTION_INFO: Dict[str, Any] = {}
 
 
 def get_short_path(path: str) -> str:
@@ -387,6 +427,82 @@ def _is_loopback_host(host: str) -> bool:
         return ipaddress.ip_address(host_clean).is_loopback
     except ValueError:
         return False
+
+
+def _normalize_driver_name(value: Any) -> Optional[str]:
+    if not value:
+        return None
+    normalized = str(value).strip().lower().replace("_", "-")
+    if normalized in {"firebird-driver", "firebird driver"}:
+        return "firebird-driver"
+    if normalized == "fdb":
+        return "fdb"
+    return None
+
+
+def _resolve_error_class(driver: str) -> Type[BaseException]:
+    if driver == "firebird-driver":
+        try:
+            from firebird.driver import Error as FirebirdError  # type: ignore
+        except ImportError as exc:  # pragma: no cover - защитно
+            raise ImportError("firebird-driver не е наличен") from exc
+        return FirebirdError  # type: ignore[return-value]
+    if driver == "fdb":
+        if fdb is None:
+            raise ImportError("fdb не е наличен")
+        error_cls = getattr(fdb, "DatabaseError", Exception)
+        return error_cls  # type: ignore[return-value]
+    raise ImportError(f"Непознат драйвер: {driver}")
+
+
+def _select_driver(profile: Dict[str, Any]) -> Tuple[str, Type[BaseException]]:
+    requested = _normalize_driver_name(profile.get("driver"))
+    candidates: List[str] = []
+    if requested:
+        candidates.append(requested)
+    else:
+        # Поддържаме обратно съвместимост – пробваме наличните по приоритет.
+        candidates.extend([drv for drv in ("firebird-driver", "fdb") if drv not in candidates])
+
+    errors: List[str] = []
+    for name in candidates:
+        try:
+            error_cls = _resolve_error_class(name)
+        except ImportError as exc:
+            errors.append(f"{name}: {exc}")
+            continue
+        return name, error_cls
+
+    if requested:
+        joined = "; ".join(errors) or "не е наличен"
+        raise MistralDBError(f"Драйвер '{requested}' не е наличен ({joined}).")
+    raise MistralDBError(
+        "Не е открит Firebird драйвер. Инсталирайте 'firebird-driver' или 'fdb'."
+    )
+
+
+def _format_connection_details(details: Dict[str, Any]) -> str:
+    if not details:
+        return "неизвестни параметри"
+    driver = details.get("driver") or "?"
+    charset = details.get("charset")
+    parts = [f"драйвер={driver}"]
+    dsn = details.get("dsn")
+    if dsn:
+        parts.append(f"dsn={dsn}")
+    else:
+        host = details.get("host")
+        port = details.get("port")
+        database = details.get("database")
+        if host:
+            parts.append(f"host={host}")
+        if port is not None:
+            parts.append(f"port={port}")
+        if database:
+            parts.append(f"database={database}")
+    if charset:
+        parts.append(f"charset={charset}")
+    return ", ".join(parts)
 
 
 class MistralDBError(RuntimeError):
@@ -486,6 +602,33 @@ def _trace(action: str, **info: Any) -> None:
 
 def get_last_login_trace() -> List[Dict[str, Any]]:
     return list(_last_login_trace)
+
+
+def get_connection_info() -> Dict[str, Any]:
+    return dict(_CONNECTION_INFO)
+
+
+def get_active_driver() -> str:
+    return _ACTIVE_DRIVER or ""
+
+
+def _exception_trace_payload(base: Dict[str, Any], exc: Exception) -> Dict[str, Any]:
+    payload = dict(base)
+    payload["error_type"] = exc.__class__.__name__
+    payload["error_message"] = str(exc)
+    sqlcode = getattr(exc, "sqlcode", None)
+    if sqlcode is not None:
+        payload["sqlcode"] = sqlcode
+    firebird_code = getattr(exc, "gds_codes", None)
+    if firebird_code:
+        try:
+            payload["gds_codes"] = list(firebird_code)
+        except TypeError:
+            payload["gds_codes"] = firebird_code
+    error_code = getattr(exc, "error_code", None)
+    if error_code is not None:
+        payload["error_code"] = error_code
+    return payload
 
 
 def _table_meta_from_login_meta(meta: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -589,8 +732,19 @@ def _transaction() -> Iterable[Any]:
         raise
 
 
-def _connect_raw(host: str, port: int, database: str, user: str, password: str, charset: str) -> FbClient:
-    client = _FB_CLIENT_CLASS()
+def _connect_raw(
+    host: str,
+    port: int,
+    database: str,
+    user: str,
+    password: str,
+    charset: str,
+    driver: str,
+) -> Tuple[FbClient, Dict[str, Any]]:
+    client_cls = _DRIVER_CLIENTS.get(driver)
+    if client_cls is None:
+        raise MistralDBError(f"Неподдържан Firebird драйвер: {driver}")
+    client = client_cls()
     try:
         conn = client.connect(host, port, database, user, password, charset)
         cursor = conn.cursor()
@@ -602,7 +756,7 @@ def _connect_raw(host: str, port: int, database: str, user: str, password: str, 
                 cursor.close()
             except Exception:  # pragma: no cover - защитно
                 pass
-        return conn
+        return conn, client.connection_details()
     except Exception:
         try:
             client.close()
@@ -1450,7 +1604,7 @@ def _ensure_delivery_generators(cur: Any) -> Tuple[Optional[str], Optional[str]]
 
 def connect(profile: Dict[str, Any]) -> Tuple[Any, Any]:
     """Установява връзка към Firebird и връща (connection, cursor)."""
-    global _CONN, _CUR, _PROFILE, _PROFILE_LABEL, _LOGIN_META
+    global _CONN, _CUR, _PROFILE, _PROFILE_LABEL, _LOGIN_META, _ACTIVE_DRIVER, _FB_ERROR, _CONNECTION_INFO
     if "database" not in profile:
         raise MistralDBError("В профила липсва ключ 'database'.")
 
@@ -1470,21 +1624,24 @@ def connect(profile: Dict[str, Any]) -> Tuple[Any, Any]:
         or database
     )
 
+    driver_name, error_cls = _select_driver(profile)
+    _ACTIVE_DRIVER = driver_name
+    _FB_ERROR = error_cls
+
     _log_info(
-        "Свързване към база",
-        profile=profile_label,
-        host=host,
-        port=port,
-        database=database,
-        driver=_FB_API,
-        charset=charset,
+        f"Свързване към база (профил={profile_label}, драйвер={driver_name}, host={host}, port={port}, database={database}, charset={charset})"
     )
     try:
-        conn = _connect_raw(host, port, database, user, password, charset)
+        conn, details = _connect_raw(host, port, database, user, password, charset, driver_name)
         cur = conn.cursor()
     except Exception as exc:  # pragma: no cover - защитно
+        _CONNECTION_INFO = {}
         logger.exception(
-            "Неуспешно свързване към база (профил: %s). host=%s, database=%s", profile_label, host, database
+            "Неуспешно свързване към база (профил: %s, драйвер: %s). host=%s, database=%s",
+            profile_label,
+            driver_name,
+            host,
+            database,
         )
         raise MistralDBError(
             f"Грешка при свързване към база (профил: {profile_label}). Проверете хост/порт/права."
@@ -1499,7 +1656,11 @@ def connect(profile: Dict[str, Any]) -> Tuple[Any, Any]:
     _DELIVERY_GENERATORS = None
     _TABLE_COLUMNS.clear()
     _DELIVERY_CONTEXT.clear()
-    _log_info("Свързването е успешно", profile=profile_label, driver=_FB_API, charset=charset)
+    _CONNECTION_INFO = dict(details)
+    if _CONNECTION_INFO.get("charset") != charset:
+        _CONNECTION_INFO["charset"] = charset
+    connection_text = _format_connection_details(_CONNECTION_INFO)
+    _log_info(f"Свързването е успешно ({connection_text}, профил={profile_label})")
     return conn, cur
 
 

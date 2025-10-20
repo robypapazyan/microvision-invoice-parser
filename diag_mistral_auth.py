@@ -226,6 +226,64 @@ def build_summary(
     forced_table: bool,
 ) -> List[str]:
     lines: List[str] = []
+    connection_entries = [
+        entry
+        for entry in trace
+        if isinstance(entry, dict)
+        and entry.get("action") in {"connect_success", "connect_attempt"}
+    ]
+    connection_info = connection_entries[-1] if connection_entries else {}
+    if connection_info:
+        conn_parts: List[str] = []
+        driver_name = connection_info.get("driver")
+        if driver_name:
+            conn_parts.append(f"драйвер {driver_name}")
+        function_name = connection_info.get("function")
+        if function_name:
+            conn_parts.append(function_name)
+        dsn_value = connection_info.get("dsn")
+        if dsn_value:
+            conn_parts.append(f"DSN {dsn_value}")
+        else:
+            host_value = connection_info.get("host")
+            port_value = connection_info.get("port")
+            database_value = connection_info.get("database")
+            if host_value:
+                conn_parts.append(f"host {host_value}")
+            if port_value is not None:
+                conn_parts.append(f"port {port_value}")
+            if database_value:
+                conn_parts.append(f"database {database_value}")
+        charset_value = connection_info.get("charset")
+        if charset_value:
+            conn_parts.append(f"charset {charset_value}")
+        if conn_parts:
+            lines.append("Свързване: " + ", ".join(conn_parts) + ".")
+
+    failure_entries = [
+        entry for entry in trace if isinstance(entry, dict) and entry.get("action") == "connect_failure"
+    ]
+    if failure_entries:
+        failure = failure_entries[-1]
+        error_bits: List[str] = []
+        function_name = failure.get("function")
+        if function_name:
+            error_bits.append(function_name)
+        sqlcode = failure.get("sqlcode")
+        if sqlcode is not None:
+            error_bits.append(f"SQLCODE {sqlcode}")
+        error_code = failure.get("error_code")
+        if error_code is not None:
+            error_bits.append(f"CODE {error_code}")
+        error_message = failure.get("error_message") or failure.get("error")
+        if error_message:
+            error_bits.append(str(error_message))
+        error_type = failure.get("error_type")
+        if error_type and error_type not in (error_message,):
+            error_bits.append(str(error_type))
+        if error_bits:
+            lines.append("Свързване: грешка – " + " | ".join(error_bits) + ".")
+
     mode = meta.get("mode")
     if mode == "sp":
         proc_name = meta.get("name") or "?"
