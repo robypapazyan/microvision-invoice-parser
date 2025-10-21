@@ -352,8 +352,13 @@ def build_summary(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Диагностика на Mistral login.")
     parser.add_argument("--profile", help="Име на профила от mistral_clients.json")
-    parser.add_argument("--user", default="", help="Потребителско име (може да е празно)")
+    parser.add_argument("--user", default="", help="Потребителско име")
     parser.add_argument("--password", default="", help="Парола")
+    parser.add_argument(
+        "--pc-id",
+        default="",
+        help="PC/terminal ID, който да се подаде към login процедурата",
+    )
     parser.add_argument(
         "--list-profiles",
         action="store_true",
@@ -474,22 +479,29 @@ def main() -> None:
         os.environ["MV_FORCE_TABLE_LOGIN"] = "1"
         print("Активиран е принудителен табличен режим (--force-table).")
 
-    if args.user or args.password:
-        user_display = args.user if args.user else "<празно>"
-        print(f"\nТестов вход с потребител='{user_display}'")
+    username = (args.user or "").strip()
+    password = args.password or ""
+    pc_id = args.pc_id.strip() or None
+
+    if username:
+        display_pc = pc_id if pc_id else "<липсва>"
+        print(f"\nТестов вход с потребител='{username}' (pc_id={display_pc})")
     else:
-        print("\nТестов вход без потребителско име (само парола)")
+        print("\nТестов вход пропуснат – липсва потребител (--user).")
 
     success = False
     error_message = ""
     operator_id: int | None = None
     operator_login = ""
-    try:
-        operator_id, operator_login = login_user(args.user or "", args.password or "")
-    except MistralDBError as exc:
-        error_message = str(exc)
+    if not username:
+        error_message = "Липсва потребителско име (--user)."
     else:
-        success = True
+        try:
+            operator_id, operator_login = login_user(username, password, pc_id=pc_id)
+        except MistralDBError as exc:
+            error_message = str(exc)
+        else:
+            success = True
 
     trace = get_last_login_trace()
 
