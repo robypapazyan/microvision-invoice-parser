@@ -27,6 +27,7 @@ from mistral_db import (  # type: ignore[attr-defined]
     get_last_login_trace,
     get_material_by_barcode,
     get_catalog_preview,
+    get_catalog_counts,
     catalog_tables_loaded,
     logger,
     login_user,
@@ -95,6 +96,51 @@ def _normalize_token(value: str | None) -> str:
     value = value or ""
     collapsed = " ".join(value.split())
     return collapsed.lower()
+
+
+def _coerce_pc_id(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        text = str(value).strip()
+    except Exception:
+        return None
+    return text or None
+
+
+def _resolve_pc_id(session: Any) -> Optional[str]:
+    candidates: List[Any] = []
+    direct_attr = getattr(session, "pc_id", None)
+    if direct_attr:
+        candidates.append(direct_attr)
+    machine_attr = getattr(session, "machine_id", None)
+    if machine_attr:
+        candidates.append(machine_attr)
+    profile = getattr(session, "profile_data", None)
+    if isinstance(profile, dict):
+        for key in (
+            "pc_id",
+            "pcId",
+            "pcid",
+            "terminal_id",
+            "terminal",
+            "workplace_id",
+            "workplace",
+            "table_no",
+            "table",
+            "table_id",
+        ):
+            if key in profile:
+                candidates.append(profile.get(key))
+    env_candidate = os.getenv("MV_PC_ID") or os.getenv("MICROVISION_PC_ID")
+    if env_candidate:
+        candidates.append(env_candidate)
+
+    for candidate in candidates:
+        pc_id = _coerce_pc_id(candidate)
+        if pc_id:
+            return pc_id
+    return None
 
 
 class Mapping:
@@ -1152,8 +1198,20 @@ def _ensure_connection(session: Any, profile_label: str, profile: Dict[str, Any]
 
 
 def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
-    username = username or ""
+    username = (username or "").strip()
     password = password or ""
+    if not username:
+        message = "Моля, въведете потребителско име."
+        logger.warning("Отказан логин без потребителско име.")
+        trace = get_last_login_trace()
+        session.last_login_trace = trace
+        return {"error": message, "trace": trace}
+    if password == "":
+        message = "Моля, въведете парола."
+        logger.warning("Отказан логин без парола.")
+        trace = get_last_login_trace()
+        session.last_login_trace = trace
+        return {"error": message, "trace": trace}
     try:
         profile_label, profile = _resolve_profile(session)
         _ensure_connection(session, profile_label, profile)
@@ -1163,25 +1221,30 @@ def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
         session.last_login_trace = trace
         return {"error": str(exc), "trace": trace}
 
+    pc_id = _resolve_pc_id(session)
     logger.info(
         "Опит за логин (профил: {}, потребител: {})",
         profile_label,
-        username or "<само парола>",
+        username,
     )
+    if pc_id:
+        logger.info("Login параметри към процедурата: потребител=%s | pc_id=%s", username, pc_id)
+    else:
+        logger.info("Login параметри към процедурата: потребител=%s | pc_id=<липсва>", username)
     try:
-        operator_id, operator_login = login_user(username, password)
+        operator_id, operator_login = login_user(username, password, pc_id=pc_id)
     except MistralDBError as exc:
         message = str(exc)
         logger.warning(
             "Логинът беше неуспешен (профил: {}, потребител: {}): {}",
             profile_label,
-            username or "<само парола>",
+            username,
             message,
         )
         if "Няма активна връзка" in message:
             try:
                 _ensure_connection(session, profile_label, profile)
-                operator_id, operator_login = login_user(username, password)
+                operator_id, operator_login = login_user(username, password, pc_id=pc_id)
             except MistralDBError as retry_exc:
                 logger.error(
                     "Повторният опит за логин се провали (профил: {}): {}",
@@ -1210,6 +1273,13 @@ def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
         )
     else:
         logger.warning("Каталожните таблици не върнаха данни след вход.")
+    catalog_totals = get_catalog_counts()
+    if catalog_totals:
+        logger.info(
+            "\U0001F4DA Реални каталожни данни: материали=%s | баркодове=%s",
+            catalog_totals.get("materials", 0),
+            catalog_totals.get("barcodes", 0),
+        )
     logger.info(
         "Успешен логин (профил: {}, потребител: {}, оператор ID: {})",
         profile_label,

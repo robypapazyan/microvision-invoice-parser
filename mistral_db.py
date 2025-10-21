@@ -1252,6 +1252,40 @@ def get_catalog_preview() -> Dict[str, Any]:
     }
 
 
+def get_catalog_counts(cur: Any | None = None) -> Dict[str, int]:
+    counts: Dict[str, int] = {"materials": 0, "barcodes": 0}
+    try:
+        active_cur = _require_cursor(cur=cur)
+    except MistralDBError as exc:
+        _log_warning(f"Неуспешно осигуряване на курсор за каталожните бройки: {exc}")
+        return counts
+
+    try:
+        schema = detect_catalog_schema(active_cur)
+    except MistralDBError as exc:
+        _log_warning(f"Неуспешно засичане на каталожната схема: {exc}")
+        return counts
+
+    materials_table = schema.get("materials_table") if isinstance(schema, dict) else None
+    barcode_table = schema.get("barcode_table") if isinstance(schema, dict) else None
+
+    if materials_table:
+        try:
+            active_cur.execute(f"SELECT COUNT(*) FROM {materials_table}")
+            value = active_cur.fetchone()
+            counts["materials"] = int(value[0]) if value else 0
+        except Exception as exc:
+            _log_warning(f"Неуспешно броене на материали от {materials_table}: {exc}")
+    if barcode_table:
+        try:
+            active_cur.execute(f"SELECT COUNT(*) FROM {barcode_table}")
+            value = active_cur.fetchone()
+            counts["barcodes"] = int(value[0]) if value else 0
+        except Exception as exc:
+            _log_warning(f"Неуспешно броене на баркодове от {barcode_table}: {exc}")
+    return counts
+
+
 def catalog_tables_loaded() -> bool:
     return _CATALOG_TABLES_READY
 
@@ -1941,17 +1975,32 @@ def detect_login_method(cur: Any | None = None) -> Dict[str, Any]:
     return fallback_meta
 
 
-def login_user(username: str, password: str) -> Tuple[int, str]:
+def login_user(username: str, password: str, *, pc_id: Any | None = None) -> Tuple[int, str]:
     """Връща (operator_id, operator_login) или вдига MistralDBError."""
 
     global _LOGIN_META
     cur = _require_cursor()
-    username = username or ""
+    username = (username or "").strip()
     password = password or ""
+    if not username:
+        _trace("missing_username")
+        _log_warning("Отказан вход без потребителско име.", profile=_profile_label())
+        raise MistralDBError("Моля, въведете потребителско име.")
+    if password == "":
+        _trace("missing_password", username=username)
+        _log_warning("Отказан вход без парола.", profile=_profile_label(), username=username)
+        raise MistralDBError("Моля, въведете парола.")
     _last_login_trace.clear()
+    normalized_pc_id = _normalize_pc_id(pc_id)
     display_user = username or "<само парола>"
-    _trace("start", profile=_profile_label(), username=display_user)
-    _log_info("Старт на логин", profile=_profile_label(), username=display_user)
+    trace_payload: Dict[str, Any] = {"profile": _profile_label(), "username": display_user}
+    if normalized_pc_id is not None:
+        trace_payload["pc_id"] = normalized_pc_id
+    _trace("start", **trace_payload)
+    log_payload: Dict[str, Any] = {"profile": _profile_label(), "username": display_user}
+    if normalized_pc_id is not None:
+        log_payload["pc_id"] = normalized_pc_id
+    _log_info("Старт на логин", **log_payload)
 
     def _finalize_success(operator_id: int, operator_login: str) -> Tuple[int, str]:
         try:
@@ -2016,7 +2065,7 @@ def login_user(username: str, password: str) -> Tuple[int, str]:
 
     try:
         if meta.get("mode") == "sp":
-            sp_result = _login_via_procedure(cur, meta, username, password)
+            sp_result = _login_via_procedure(cur, meta, username, password, normalized_pc_id)
             if sp_result is not None:
                 operator_id, operator_login = sp_result
                 _trace(
@@ -2075,9 +2124,32 @@ def login_user(username: str, password: str) -> Tuple[int, str]:
         raise
 
 
-def _build_procedure_args(inputs: List[Dict[str, Any]], username: str, password: str) -> List[Any]:
+def _build_procedure_args(
+    inputs: List[Dict[str, Any]],
+    username: str,
+    password: str,
+    pc_id: Any | None = None,
+) -> List[Any]:
     login_param_names = {"LOGIN", "USERNAME", "USER_NAME", "CODE", "OPERATOR"}
     pass_param_names = {"PASS", "PASSWORD", "PAROLA", "PWD"}
+    pc_param_names = {
+        "PCID",
+        "PC_ID",
+        "PC",
+        "TERMINAL",
+        "TERMINALID",
+        "TERMINAL_ID",
+        "WORKPLACE",
+        "WORKPLACEID",
+        "WORKPLACE_ID",
+        "TABLE",
+        "TABLENO",
+        "TABLE_NO",
+        "TABLEID",
+        "TABLE_ID",
+        "STATION",
+    }
+    normalized_pc_id = _normalize_pc_id(pc_id)
     args: List[Any] = [None] * len(inputs)
     for field in inputs:
         pname = (field.get("name") or "").upper()
@@ -2086,9 +2158,109 @@ def _build_procedure_args(inputs: List[Dict[str, Any]], username: str, password:
             args[pos] = username or None
         elif pname in pass_param_names:
             args[pos] = password
+        elif pname in pc_param_names:
+            args[pos] = normalized_pc_id
         else:
             args[pos] = None
     return args
+
+
+def _normalize_pc_id(pc_id: Any | None) -> Any | None:
+    if pc_id is None:
+        return None
+    if isinstance(pc_id, bool):
+        return int(pc_id)
+    if isinstance(pc_id, (int,)):
+        return pc_id
+    if isinstance(pc_id, float):
+        try:
+            return int(pc_id)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(pc_id, Decimal):
+        try:
+            return int(pc_id)
+        except (TypeError, ValueError, InvalidOperation):
+            return None
+    try:
+        text = str(pc_id).strip()
+    except Exception:
+        return None
+    if not text:
+        return None
+    if text.isdigit():
+        try:
+            return int(text)
+        except ValueError:
+            return text
+    return text
+
+
+def _value_is_affirmative(value: Any) -> bool:
+    if value in (None, ""):
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int,)):
+        return value != 0
+    if isinstance(value, float):
+        return value != 0.0
+    if isinstance(value, Decimal):
+        return value != 0
+    try:
+        text = str(value).strip()
+    except Exception:
+        return False
+    if not text:
+        return False
+    normalized = text.upper()
+    return normalized in {"1", "TRUE", "T", "YES", "Y", "OK", "ДА", "VALID", "SUCCESS"}
+
+
+def _procedure_result_allows_login(
+    row: Sequence[Any],
+    outputs: List[Dict[str, Any]],
+    description: Optional[Sequence[Sequence[Any]]] = None,
+) -> bool:
+    success_tokens = (
+        "OK",
+        "SUCCESS",
+        "VALID",
+        "ALLOW",
+        "ALLOWED",
+        "STATUS",
+        "RESULT",
+        "ISVALID",
+        "IS_OK",
+        "AUTHORIZED",
+        "AUTH",
+    )
+    names_from_description: List[str] = []
+    if description:
+        for col in description:
+            if not col:
+                continue
+            raw_name = col[0] if isinstance(col, (list, tuple)) else None
+            if raw_name:
+                names_from_description.append(str(raw_name).strip().upper())
+
+    found_token = False
+    for idx, value in enumerate(row):
+        name_candidate = ""
+        if idx < len(outputs):
+            name_candidate = str(outputs[idx].get("name") or "").strip().upper()
+        if not name_candidate and idx < len(names_from_description):
+            name_candidate = names_from_description[idx]
+        normalized_name = name_candidate.replace("_", "").replace(" ", "")
+        if not normalized_name:
+            continue
+        if any(token in normalized_name for token in success_tokens):
+            found_token = True
+            if not _value_is_affirmative(value):
+                return False
+    if found_token:
+        return True
+    return True
 
 
 def _is_no_result_set_error(exc: Exception) -> bool:
@@ -2178,7 +2350,11 @@ def _extract_operator_from_row(
 
 
 def _login_via_procedure(
-    cur: Any, meta: Dict[str, Any], username: str, password: str
+    cur: Any,
+    meta: Dict[str, Any],
+    username: str,
+    password: str,
+    pc_id: Any | None = None,
 ) -> Optional[Tuple[int, str]]:
     name = meta.get("name")
     if not name:
@@ -2186,11 +2362,31 @@ def _login_via_procedure(
 
     inputs = meta.get("fields", {}).get("inputs", [])
     outputs = meta.get("fields", {}).get("outputs", [])
-    args = _build_procedure_args(inputs, username, password)
+    args = _build_procedure_args(inputs, username, password, pc_id)
     placeholders = ", ".join(["?"] * len(inputs))
     sp_kind = (meta.get("sp_kind") or "executable").lower()
 
-    params_payload = {"username": username or "<празно>", "password": "***" if password else ""}
+    params_payload: Dict[str, Any] = {
+        "username": username or "<празно>",
+        "password": "***" if password else "",
+    }
+    if pc_id is not None:
+        params_payload["pc_id"] = pc_id
+
+    if pc_id is not None:
+        _log_info(
+            "SP login параметри",
+            procedure=name,
+            username=username or "<празно>",
+            pc_id=pc_id,
+        )
+    else:
+        _log_info(
+            "SP login параметри",
+            procedure=name,
+            username=username or "<празно>",
+            pc_id="<липсва>",
+        )
 
     if sp_kind == "selectable":
         sql = f"SELECT * FROM {name}({placeholders})" if placeholders else f"SELECT * FROM {name}"
@@ -2211,6 +2407,18 @@ def _login_via_procedure(
         else:
             if rows:
                 row = rows[0]
+                if not _procedure_result_allows_login(row, outputs, description):
+                    _trace(
+                        "sp_denied",
+                        procedure=name,
+                        mode="select",
+                        reason="unsuccessful-result",
+                    )
+                    _log_warning(
+                        "Процедурата върна отказ за достъп.",
+                        procedure=name,
+                    )
+                    return None
                 result = _extract_operator_from_row(row, outputs, username, description)
                 if result is not None:
                     operator_id, operator_login = result
@@ -2245,6 +2453,16 @@ def _login_via_procedure(
 
     if not row:
         _trace("sp_no_result", procedure=name, mode="execute")
+        return None
+
+    if not _procedure_result_allows_login(row, outputs, description):
+        _trace(
+            "sp_denied",
+            procedure=name,
+            mode="execute",
+            reason="unsuccessful-result",
+        )
+        _log_warning("Процедурата върна отказ за достъп.", procedure=name)
         return None
 
     result = _extract_operator_from_row(row, outputs, username, description)
