@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 
 import db_integration
 from mistral_db import logger
@@ -98,6 +98,10 @@ class SessionState:
     ui_root: Any = None
     output_logger: Optional[Callable[[str], None]] = None
     unresolved_items: List[Dict[str, Any]] = field(default_factory=list)
+    catalog_preview: Dict[str, Any] = field(default_factory=dict)
+    catalog_loaded: bool = False
+    materials_preview: List[Dict[str, Any]] = field(default_factory=list)
+    barcodes_preview: List[Dict[str, Any]] = field(default_factory=list)
 
 
 
@@ -506,9 +510,18 @@ class MicroVisionApp:
         ttk.Label(status, textvariable=self.status_summary_var).pack(side="left", padx=(12, 0))
         ttk.Label(status, textvariable=self.license_var, foreground="#555").pack(side="right")
 
-    def _log(self, text: str) -> None:
-        self.output_text.insert(tk.END, text + "\n")
-        self.output_text.see(tk.END)
+    def _log(self, *args: Any) -> None:
+        message = " ".join(str(arg) for arg in args) if args else ""
+        try:
+            self.output_text.insert(tk.END, message + "\n")
+            self.output_text.see(tk.END)
+        except Exception:
+            pass
+        if message:
+            try:
+                logger.info(message)
+            except Exception:
+                pass
 
     def _on_open_logs(self) -> None:
         log_dir = Path(__file__).resolve().parent / "logs"
@@ -855,6 +868,16 @@ class MicroVisionApp:
         self.password_var.set("")
         self._toggle_login_diag_button(True)
         self._refresh_license_text()
+        if self.session.catalog_loaded:
+            materials_preview = getattr(self.session, "materials_preview", []) or []
+            barcodes_preview = getattr(self.session, "barcodes_preview", []) or []
+            self._log(
+                f"📚 Заредени каталожни данни: материали={len(materials_preview)} | баркодове={len(barcodes_preview)}"
+            )
+        else:
+            self._log(
+                "⚠️ Няма заредена таблица с материали – автоматичните съвпадения са ограничени."
+            )
 
     def _legacy_login_bridge(self, username: str, password: str) -> Optional[Dict[str, Any]]:
         assert self.session.profile_data is not None
@@ -1028,6 +1051,85 @@ class MicroVisionApp:
         }
         db_integration.apply_candidate_choice(row, candidate, source)
 
+    def _prompt_manual_code(
+        self,
+        index: int,
+        row: Dict[str, Any],
+        mapping: db_integration.Mapping,
+        supplier_key: str,
+        description: Optional[str],
+        token: str,
+        barcode: Optional[str],
+        resolver: Optional[db_integration.DbItemResolver],
+    ) -> Optional[str]:
+        prompt_text = description or token or row.get("name") or row.get("description") or ""
+        initial_code = (
+            row.get("code")
+            or row.get("Номер")
+            or row.get("item_code")
+            or row.get("Артикул")
+            or ""
+        )
+        while True:
+            try:
+                manual_code = simpledialog.askstring(
+                    "Ръчно въвеждане на материал",
+                    (
+                        "Въведете материален код за ред {idx}.\n" "Описание: {text}"
+                    ).format(idx=index, text=prompt_text or "(без описание)"),
+                    parent=self.root,
+                    initialvalue=str(initial_code) if initial_code else None,
+                )
+            except Exception:
+                manual_code = None
+            if manual_code is None:
+                return None
+            code = manual_code.strip()
+            if not code:
+                try:
+                    messagebox.showwarning(
+                        "Ръчно въвеждане",
+                        "Моля, въведете валиден MATERIALCODE.",
+                    )
+                except Exception:
+                    pass
+                continue
+            hit: Optional[db_integration.ItemHit] = None
+            if resolver is not None:
+                try:
+                    hit = resolver.ensure_item(code)
+                except Exception as exc:
+                    self._log(f"⚠️ Ред {index}: проверката на код {code} е неуспешна: {exc}")
+            if resolver is not None and not hit:
+                retry = False
+                try:
+                    retry = messagebox.askretrycancel(
+                        "Ръчно въвеждане",
+                        f"Код {code} не беше намерен в каталога. Опитайте отново?",
+                    )
+                except Exception:
+                    retry = False
+                if retry:
+                    continue
+                return None
+            if hit is None:
+                name = (
+                    description
+                    or row.get("name")
+                    or row.get("description")
+                    or token
+                    or code
+                )
+                hit = {"code": code, "name": name}
+            self._apply_hit(row, hit, "manual", "manual", barcode)
+            if barcode:
+                mapping.set_mapped_barcode(supplier_key, barcode, hit["code"])
+            key_text = description or token
+            if key_text:
+                mapping.set_mapped_text(supplier_key, key_text, hit["code"])
+            self._log(f"✅ Ред {index}: ръчно зададен материал {hit['code']}")
+            return "manual"
+
     def _resolve_rows(self, rows: List[Dict[str, Any]]) -> bool:
         mapping = self.mapping_store
         supplier_key = self._determine_supplier_key()
@@ -1038,11 +1140,11 @@ class MicroVisionApp:
                 resolver = db_integration.DbItemResolver(cur)
                 self.session.catalog = resolver.catalog
                 catalog = resolver.catalog
+                code_id = catalog.get("code_id_col") or "MATERIALCODE"
+                code_col = catalog.get("code_col") or "CODE"
+                fk_col = catalog.get("fk_col") or "FK_STORAGEMATERIALCODE"
                 self._log(
-                    "Каталожна схема: MATERIAL({}) ↔ BARCODE(code={}, fk={})",
-                    catalog.get("code_id_col") or "MATERIALCODE",
-                    catalog.get("code_col") or "CODE",
-                    catalog.get("fk_col") or "FK_STORAGEMATERIALCODE",
+                    f"Каталожна схема: MATERIAL({code_id}) ↔ BARCODE(code={code_col}, fk={fk_col})"
                 )
             except db_integration.MistralDBError as exc:
                 self._log(f"⚠️ Схема неразпозната: {exc}")
@@ -1161,7 +1263,16 @@ class MicroVisionApp:
                     )
 
         if resolver is None:
-            return None
+            return self._prompt_manual_code(
+                index,
+                row,
+                mapping,
+                supplier_key,
+                description,
+                token,
+                barcode,
+                None,
+            )
 
         hits: List[db_integration.ItemHit] = []
         mapping_kind: Optional[str] = None
@@ -1180,6 +1291,18 @@ class MicroVisionApp:
                 continue
             seen_codes.add(hit["code"])
             hits.append(hit)
+        if not hits:
+            return self._prompt_manual_code(
+                index,
+                row,
+                mapping,
+                supplier_key,
+                description,
+                token,
+                barcode,
+                resolver,
+            )
+
         dialog = ItemResolverDialog(
             self.root,
             resolver,
@@ -1204,8 +1327,11 @@ class MicroVisionApp:
         elif mapping_type == "manual":
             self._apply_hit(row, hit, "manual", "manual", barcode)
             source_key = "manual"
-            if save_mapping and description:
-                mapping.set_mapped_text(supplier_key, description, hit["code"])
+            if barcode:
+                mapping.set_mapped_barcode(supplier_key, barcode, hit["code"])
+            key_text = description or token
+            if key_text:
+                mapping.set_mapped_text(supplier_key, key_text, hit["code"])
         else:
             self._apply_hit(row, hit, "db-text", "text", barcode)
             source_key = "db"
