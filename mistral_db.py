@@ -115,6 +115,9 @@ _CATALOG_SCHEMA: Dict[str, str | None] | None = None
 _DELIVERY_CONTEXT: Dict[int, Dict[str, Any]] = {}
 _FIELD_LENGTH_CACHE: Dict[tuple[str, str], int] = {}
 _last_login_trace: List[Dict[str, Any]] = []
+_CATALOG_PREVIEW_MATERIALS: List[Dict[str, str]] = []
+_CATALOG_PREVIEW_BARCODES: List[Dict[str, str]] = []
+_CATALOG_TABLES_READY: bool = False
 
 
 def _configure_logging() -> None:
@@ -1203,6 +1206,62 @@ def _clean_string(value: Any) -> Optional[str]:
     return text or None
 
 
+def _prime_catalog_preview(cur: Any) -> None:
+    global _CATALOG_PREVIEW_MATERIALS, _CATALOG_PREVIEW_BARCODES, _CATALOG_TABLES_READY
+    materials: List[Dict[str, str]] = []
+    barcodes: List[Dict[str, str]] = []
+
+    try:
+        cur.execute("SELECT FIRST 10 MATERIALCODE, MATERIAL FROM MATERIAL")
+        rows = cur.fetchall() or []
+        for row in rows:
+            if not row:
+                continue
+            code = _clean_string(row[0]) or ""
+            if not code:
+                continue
+            name = _clean_string(row[1]) or ""
+            materials.append({"code": code, "name": name})
+    except Exception as exc:
+        _log_warning(f"Неуспешно зареждане на примерни материали: {exc}")
+
+    try:
+        cur.execute("SELECT FIRST 10 CODE, STORAGEMATERIALCODE FROM BARCODE")
+        rows = cur.fetchall() or []
+        for row in rows:
+            if not row:
+                continue
+            barcode = _clean_string(row[0]) or ""
+            material_code = _clean_string(row[1]) or ""
+            if not barcode or not material_code:
+                continue
+            barcodes.append({"barcode": barcode, "material_code": material_code})
+    except Exception as exc:
+        _log_warning(f"Неуспешно зареждане на примерни баркодове: {exc}")
+
+    _CATALOG_PREVIEW_MATERIALS = materials
+    _CATALOG_PREVIEW_BARCODES = barcodes
+    _CATALOG_TABLES_READY = bool(materials) and bool(barcodes)
+
+
+def get_catalog_preview() -> Dict[str, Any]:
+    return {
+        "materials": list(_CATALOG_PREVIEW_MATERIALS),
+        "barcodes": list(_CATALOG_PREVIEW_BARCODES),
+        "loaded": _CATALOG_TABLES_READY,
+    }
+
+
+def catalog_tables_loaded() -> bool:
+    return _CATALOG_TABLES_READY
+
+
+def refresh_catalog_preview(cur: Any | None = None) -> Dict[str, Any]:
+    active_cur = _require_cursor(cur=cur)
+    _prime_catalog_preview(active_cur)
+    return get_catalog_preview()
+
+
 def _decimal_or_none(value: Any) -> Optional[Decimal]:
     if value in (None, ""):
         return None
@@ -1894,6 +1953,13 @@ def login_user(username: str, password: str) -> Tuple[int, str]:
     _trace("start", profile=_profile_label(), username=display_user)
     _log_info("Старт на логин", profile=_profile_label(), username=display_user)
 
+    def _finalize_success(operator_id: int, operator_login: str) -> Tuple[int, str]:
+        try:
+            _prime_catalog_preview(cur)
+        except Exception as exc:  # pragma: no cover - защитно
+            _log_warning(f"Неуспешно опресняване на каталога след вход: {exc}")
+        return operator_id, operator_login
+
     force_table = os.getenv("MV_FORCE_TABLE_LOGIN", "").strip() == "1"
     if force_table:
         _trace("force_table_login", profile=_profile_label())
@@ -1929,7 +1995,7 @@ def login_user(username: str, password: str) -> Tuple[int, str]:
             match=match_mode,
             operator_id=operator_id,
         )
-        return operator_id, operator_login
+        return _finalize_success(operator_id, operator_login)
 
     if _LOGIN_META is None:
         _LOGIN_META = detect_login_method(cur)
@@ -1971,7 +2037,7 @@ def login_user(username: str, password: str) -> Tuple[int, str]:
                     procedure=meta.get("name"),
                     username=display_user,
                 )
-                return operator_id, operator_login
+                return _finalize_success(operator_id, operator_login)
             _trace(
                 "procedure_fallback_table",
                 procedure=meta.get("name"),
@@ -1997,7 +2063,7 @@ def login_user(username: str, password: str) -> Tuple[int, str]:
             match=match_mode,
             operator_id=operator_id,
         )
-        return operator_id, operator_login
+        return _finalize_success(operator_id, operator_login)
     except MistralDBError as exc:
         _trace("error", message=str(exc))
         _log_warning(

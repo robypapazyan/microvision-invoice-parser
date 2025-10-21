@@ -26,6 +26,8 @@ from mistral_db import (  # type: ignore[attr-defined]
     get_connection_info,
     get_last_login_trace,
     get_material_by_barcode,
+    get_catalog_preview,
+    catalog_tables_loaded,
     logger,
     login_user,
     push_items_to_mistral,
@@ -1195,6 +1197,19 @@ def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
             return {"error": message, "trace": trace}
 
     session.profile_label = profile_label
+    preview = get_catalog_preview()
+    session.catalog_preview = preview
+    session.catalog_loaded = bool(preview.get("loaded")) or catalog_tables_loaded()
+    session.materials_preview = list(preview.get("materials", []))
+    session.barcodes_preview = list(preview.get("barcodes", []))
+    if session.catalog_loaded:
+        logger.info(
+            "Каталожните таблици са заредени: материали={}, баркодове={}",
+            len(session.materials_preview),
+            len(session.barcodes_preview),
+        )
+    else:
+        logger.warning("Каталожните таблици не върнаха данни след вход.")
     logger.info(
         "Успешен логин (профил: {}, потребител: {}, оператор ID: {})",
         profile_label,
