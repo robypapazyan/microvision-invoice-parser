@@ -497,13 +497,13 @@ def main() -> None:
     table_no = profile.get("table_no") or profile.get("TABLENO") or 1
 
     try:
-        success = check_login_credentials(
+        success, message = check_login_credentials(
             username,
             password,
-            object_id=object_id,
             table_no=table_no,
+            location_id=object_id,
         )
-        error_message = "" if success else (get_last_login_status().get("error") or "неуспешен вход")
+        error_message = "" if success else (message or get_last_login_status().get("error") or "неуспешен вход")
     except MistralDBError as exc:
         success = False
         error_message = str(exc)

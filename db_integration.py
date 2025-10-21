@@ -1205,39 +1205,54 @@ def _ensure_connection(session: Any, profile_label: str, profile: Dict[str, Any]
 def db_check_login(session: Any, username: str, password: str) -> bool:
     """Проверява входа чрез реалната база данни."""
 
+    def _safe_int(value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return default
+
     username = (username or "").strip()
     password = password or ""
     profile_label, profile = _resolve_profile(session)
     conn, cur = _ensure_connection(session, profile_label, profile)
+    table_no_raw = (
+        profile.get("table_no")
+        or profile.get("TABLENO")
+        or profile.get("table")
+    )
+    location_id_raw = profile.get("object_id") or profile.get("OBJECTID")
+    effective_table_no = None if table_no_raw is None else _safe_int(table_no_raw, 1)
+    effective_location_id = _safe_int(location_id_raw, 1)
+
     logger.info(
-        "db_integration:login start profile=%s username=%s",
+        "db_integration:login start profile=%s username=%s table_no=%s location_id=%s",
         profile_label,
         username or "<password-only>",
+        "<none>" if effective_table_no is None else effective_table_no,
+        effective_location_id,
     )
-    object_id = profile.get("object_id") or profile.get("OBJECTID")
-    table_no = profile.get("table_no") or profile.get("TABLENO") or profile.get("table")
+
     try:
         _require_cursor(conn, cur, profile_label)
-        valid = check_login_credentials(
+        ok, message = check_login_credentials(
             username,
             password,
-            object_id=object_id or 1,
-            table_no=table_no or 1,
+            table_no=effective_table_no,
+            location_id=effective_location_id,
+            conn=conn,
+            cur=cur,
         )
-        if valid:
-            logger.info(
-                "db_integration:login success profile=%s username=%s mode=%s",
-                profile_label,
-                username or "<password-only>",
-                get_last_login_status().get("mode"),
-            )
-        else:
-            logger.info(
-                "db_integration:login rejected profile=%s username=%s",
-                profile_label,
-                username or "<password-only>",
-            )
-        return bool(valid)
+        logger.info(
+            "db_integration:login result profile=%s username=%s -> %s",
+            profile_label,
+            username or "<password-only>",
+            message,
+        )
+        if not ok:
+            raise RuntimeError(message)
+        return True
+    except RuntimeError:
+        raise
     except Exception as exc:
         logger.error(
             "db_integration:login error profile=%s username=%s → %s",
@@ -1295,7 +1310,18 @@ def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
         username or "<само парола>",
     )
     try:
-        is_valid = db_check_login(session, username, password)
+        db_check_login(session, username, password)
+    except RuntimeError as exc:
+        error_message = str(exc)
+        logger.warning(
+            "Логинът беше отхвърлен (профил: {}, потребител: {}): {}",
+            profile_label,
+            username or "<само парола>",
+            error_message,
+        )
+        trace = get_last_login_trace()
+        session.last_login_trace = trace
+        return {"error": error_message, "trace": trace}
     except Exception as exc:
         logger.error(
             "Логинът беше неуспешен (профил: {}, потребител: {}): {}",
@@ -1306,19 +1332,6 @@ def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
         trace = get_last_login_trace()
         session.last_login_trace = trace
         return {"error": str(exc), "trace": trace}
-
-    if not is_valid:
-        status = get_last_login_status()
-        error_message = status.get("error") or "Невалиден потребител или парола."
-        logger.warning(
-            "Логинът беше отхвърлен (профил: {}, потребител: {}): {}",
-            profile_label,
-            username or "<само парола>",
-            error_message,
-        )
-        trace = get_last_login_trace()
-        session.last_login_trace = trace
-        return {"error": error_message, "trace": trace}
 
     session.profile_label = profile_label
     preview = get_catalog_preview()
