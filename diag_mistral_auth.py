@@ -16,10 +16,11 @@ from mistral_db import (  # type: ignore[attr-defined]
     detect_catalog_schema,
     detect_login_method,
     find_material_candidates,
+    get_last_login_status,
     get_last_login_trace,
     get_material_by_barcode,
     logger,
-    login_user,
+    check_login_credentials,
 )
 
 CLIENTS_FILE = Path(__file__).with_name("mistral_clients.json")
@@ -483,37 +484,61 @@ def main() -> None:
     password = args.password or ""
     pc_id = args.pc_id.strip() or None
 
-    if username:
-        display_pc = pc_id if pc_id else "<липсва>"
-        print(f"\nТестов вход с потребител='{username}' (pc_id={display_pc})")
-    else:
-        print("\nТестов вход пропуснат – липсва потребител (--user).")
+    display_pc = pc_id if pc_id else "<липсва>"
+    print(
+        "\nТестов вход (потребител='{}', парола='{}', pc_id={})".format(
+            username or "<само парола>",
+            "***" if password else "<празна>",
+            display_pc,
+        )
+    )
 
-    success = False
-    error_message = ""
-    operator_id: int | None = None
-    operator_login = ""
-    if not username:
-        error_message = "Липсва потребителско име (--user)."
-    else:
-        try:
-            operator_id, operator_login = login_user(username, password, pc_id=pc_id)
-        except MistralDBError as exc:
-            error_message = str(exc)
-        else:
-            success = True
+    object_id = profile.get("object_id") or profile.get("OBJECTID") or 1
+    table_no = profile.get("table_no") or profile.get("TABLENO") or 1
 
+    try:
+        success = check_login_credentials(
+            username,
+            password,
+            object_id=object_id,
+            table_no=table_no,
+        )
+        error_message = "" if success else (get_last_login_status().get("error") or "неуспешен вход")
+    except MistralDBError as exc:
+        success = False
+        error_message = str(exc)
+    except Exception as exc:  # pragma: no cover - защитно
+        success = False
+        error_message = str(exc)
+
+    status_meta = get_last_login_status()
     trace = get_last_login_trace()
 
     if success:
         print(
             "LOGIN RESULT: SUCCESS "
-            f"(operator_id={operator_id}, operator_login={operator_login})"
+            f"(mode={status_meta.get('mode') or 'неизвестен'})"
         )
     else:
-        print(f"LOGIN RESULT: FAILURE ({error_message or 'неуспешен вход'})")
+        print(
+            "LOGIN RESULT: FAILURE ({} | mode={})".format(
+                error_message or "неуспешен вход",
+                status_meta.get("mode") or "неизвестен",
+            )
+        )
 
-    summary_lines = build_summary(meta, trace, success, operator_id, operator_login, error_message, args.force_table)
+    operator_id = 1 if success else None
+    operator_login = username or "1"
+
+    summary_lines = build_summary(
+        meta,
+        trace,
+        success,
+        operator_id,
+        operator_login,
+        error_message,
+        args.force_table,
+    )
     print("\nSUMMARY:")
     for line in summary_lines:
         print(f"{SUMMARY_PREFIX} {line}")
