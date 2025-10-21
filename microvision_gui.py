@@ -468,9 +468,12 @@ class MicroVisionApp:
 
         self.login_status_var = tk.StringVar(value="Вход: няма активна сесия.")
         ttk.Button(strip, text="Вход", command=self._on_login_clicked).grid(row=0, column=6, padx=(0, 12))
-        ttk.Label(strip, textvariable=self.login_status_var, foreground="#006400").grid(
-            row=0, column=7, sticky="w"
+        self.login_status_label = ttk.Label(
+            strip,
+            textvariable=self.login_status_var,
+            foreground="#006400",
         )
+        self.login_status_label.grid(row=0, column=7, sticky="w")
         self.login_diag_btn = ttk.Button(
             strip,
             text="Покажи диагностика",
@@ -836,7 +839,11 @@ class MicroVisionApp:
             self.last_login_trace = trace or []
             self.session.last_login_trace = self.last_login_trace
             self.session.password = ""
-            self.login_status_var.set("Вход: неуспешен.")
+            self.login_status_var.set(f"Вход: неуспешен – {message}")
+            try:
+                self.login_status_label.configure(foreground="#8B0000")
+            except Exception:
+                pass
             self._log(f"❌ {message}")
             self._toggle_login_diag_button(True)
             try:
@@ -845,6 +852,11 @@ class MicroVisionApp:
                 pass
             return
         if not result:
+            self.login_status_var.set("Вход: неуспешен – Невалидни данни за вход.")
+            try:
+                self.login_status_label.configure(foreground="#8B0000")
+            except Exception:
+                pass
             self._log("❌ Невалидни данни за вход.")
             return
 
@@ -863,7 +875,11 @@ class MicroVisionApp:
 
         display_user = effective_username or ("само парола" if not username else username)
         suffix = f" (ID: {user_id})" if user_id is not None else ""
-        self.login_status_var.set(f"Вход: {display_user}{suffix}")
+        self.login_status_var.set("Вход: успешен.")
+        try:
+            self.login_status_label.configure(foreground="#006400")
+        except Exception:
+            pass
         self._log(f"✅ Успешен вход: {display_user}{suffix}")
         self.password_var.set("")
         self._toggle_login_diag_button(True)

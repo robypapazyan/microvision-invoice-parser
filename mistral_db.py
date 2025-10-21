@@ -1974,76 +1974,163 @@ def _coerce_int(value: Any, default: int) -> int:
         return default
 
 
+def _bool_from_db(value: object) -> bool:
+    """Normalize truthy values coming from Firebird CHAR(1) / VARCHAR."""
+
+    if value is None:
+        return False
+    try:
+        text = str(value)
+    except Exception:  # pragma: no cover - защитно
+        return False
+    return text.strip().upper() in {"1", "Y", "T", "TRUE"}
+
+
+def _first_truthy_column(row: Any, cursor_description: Sequence[Any] | None) -> bool:
+    """Извлича булева стойност от ред, като допуска различни имена на колоната."""
+
+    if row is None:
+        return False
+
+    if cursor_description:
+        names = []
+        for desc in cursor_description:
+            try:
+                names.append((desc[0] if desc else None))
+            except Exception:  # pragma: no cover - защитно
+                names.append(None)
+        mapping = {((name or "").upper()): idx for idx, name in enumerate(names)}
+        for key in ("CHRRESULT", "CHRESULT", "RESULT"):
+            idx = mapping.get(key)
+            if idx is not None:
+                try:
+                    return _bool_from_db(row[idx])
+                except Exception:  # pragma: no cover - защитно
+                    return False
+
+    try:
+        return _bool_from_db(row[0])
+    except Exception:  # pragma: no cover - защитно
+        return False
+
+
 def check_login_credentials(
     username: str,
     password: str,
     *,
-    object_id: Any | None = None,
-    table_no: Any | None = None,
-) -> bool:
-    """Проверява входните данни чрез процедурата или USERS таблицата."""
+    table_no: Any | None = 1,
+    location_id: Any = 1,
+    conn: Any | None = None,
+    cur: Any | None = None,
+) -> tuple[bool, str]:
+    """Валидира входа срещу USERS и (по избор) CHECKUSERFORTABLENO."""
 
-    cur = _require_cursor()
     username = (username or "").strip()
     password = password or ""
-    effective_object_id = _coerce_int(object_id, 1)
-    effective_table_no = _coerce_int(table_no, 1)
+    if not username:
+        _set_login_status("failed", "Липсва потребителско име.")
+        return False, "Моля, въведете потребителско име."
+    if not password:
+        _set_login_status("failed", "Липсва парола.")
+        return False, "Моля, въведете парола."
 
+    effective_table_no = None if table_no is None else _coerce_int(table_no, 1)
+    effective_location_id = _coerce_int(location_id, 1)
+
+    active_cur = _require_cursor(conn=conn, cur=cur)
+    profile = _profile_label()
     logger.info(
-        "mistral_db:login_attempt profile=%s username=%s",
-        _profile_label(),
-        username or "<password-only>",
+        "mistral_db:login attempt profile=%s username=%s table_no=%s location_id=%s",
+        profile,
+        username,
+        "<none>" if effective_table_no is None else effective_table_no,
+        effective_location_id,
     )
 
     try:
-        if username and _procedure_exists(cur, "CHECKUSERFORTABLENO"):
-            logger.debug("mistral_db:login using CHECKUSERFORTABLENO")
-            _set_login_status("procedure")
-            cur.execute(
-                "SELECT CHRESULT FROM CHECKUSERFORTABLENO(?, ?, ?)",
-                (effective_object_id, username, effective_table_no),
-            )
-            row = cur.fetchone()
-            result = (row[0] if row else None)
-            if result is None:
-                _set_login_status("procedure", "Процедурата не върна стойност.")
-                return False
-            ch_result = str(result).strip()
-            logger.debug("mistral_db:login procedure result=%s", ch_result)
-            success = ch_result == "1"
-            if not success:
-                _set_login_status("procedure", f"CHRESULT={ch_result or '0'}")
-            else:
-                _set_login_status("procedure")
-            return success
-
-        logger.debug("mistral_db:login using USERS fallback")
-        _set_login_status("fallback")
-        sql = [
-            "SELECT COUNT(*) FROM USERS WHERE 1=1",
-        ]
-        params: List[Any] = []
-        if username:
-            sql.append("AND UPPER(TRIM(NAME)) = UPPER(TRIM(?))")
-            params.append(username)
-        else:
-            sql.append("AND NAME IS NOT NULL")
-        sql.append("AND TRIM(PASS) = TRIM(?)")
-        params.append(password)
-        query = " ".join(sql)
-        cur.execute(query, tuple(params))
-        row = cur.fetchone()
+        active_cur.execute(
+            """
+            SELECT COUNT(*) AS MATCHES
+            FROM USERS
+            WHERE UPPER(NAME) = UPPER(?) AND TRIM(PASS) = TRIM(?)
+            """,
+            (username, password),
+        )
+        row = active_cur.fetchone()
         matches = int(row[0]) if row and row[0] is not None else 0
-        logger.debug("mistral_db:login fallback matches=%s", matches)
-        if matches > 0:
-            _set_login_status("fallback")
-            return True
-        _set_login_status("fallback", "Невалидни потребител/парола")
-        return False
+        logger.debug("mistral_db:login users matches=%s", matches)
+        if matches <= 0:
+            _set_login_status("fallback", "Невалиден потребител/парола.")
+            return False, "Невалиден потребител/парола."
+
+        _set_login_status("fallback")
+
+        use_table_check = effective_table_no is not None
+        procedure_available = False
+        if use_table_check:
+            try:
+                procedure_available = _procedure_exists(active_cur, "CHECKUSERFORTABLENO")
+            except Exception as exists_exc:  # pragma: no cover - защитно
+                logger.debug(
+                    "mistral_db:login unable to detect CHECKUSERFORTABLENO (%s) – will attempt",
+                    exists_exc,
+                )
+                procedure_available = True
+
+        if use_table_check and not procedure_available:
+            logger.warning(
+                "mistral_db:login CHECKUSERFORTABLENO missing – skipping permission check",
+            )
+            use_table_check = False
+
+        if use_table_check:
+            allowed = False
+            logger.debug("mistral_db:login invoking CHECKUSERFORTABLENO via SELECT")
+            try:
+                active_cur.execute(
+                    "SELECT FIRST 1 * FROM CHECKUSERFORTABLENO(?, ?, ?)",
+                    (effective_location_id, username, effective_table_no),
+                )
+                row = active_cur.fetchone()
+                allowed = _first_truthy_column(row, active_cur.description)
+            except Exception as select_exc:
+                logger.debug(
+                    "mistral_db:login SELECT variant failed (%s) – trying callproc",
+                    select_exc,
+                )
+                try:
+                    proc_result = active_cur.callproc(
+                        "CHECKUSERFORTABLENO",
+                        (effective_location_id, username, effective_table_no),
+                    )
+                    if isinstance(proc_result, (list, tuple)):
+                        allowed = _bool_from_db(proc_result[0] if proc_result else None)
+                    else:
+                        allowed = _bool_from_db(proc_result)
+                except Exception as proc_exc:
+                    _set_login_status("procedure", str(proc_exc))
+                    logger.error(
+                        "mistral_db:login CHECKUSERFORTABLENO error (%s)",
+                        proc_exc,
+                    )
+                    return False, f"Грешка при CHECKUSERFORTABLENO: {proc_exc}"
+
+            if not allowed:
+                _set_login_status("procedure", "Отказ от CHECKUSERFORTABLENO")
+                return False, "Достъпът е отказан от CHECKUSERFORTABLENO."
+
+            _set_login_status("procedure")
+
+        logger.info(
+            "mistral_db:login success profile=%s username=%s",
+            profile,
+            username,
+        )
+        return True, "Успешен вход."
     except Exception as exc:  # pragma: no cover - защитно
         _set_login_status("failed", str(exc))
-        logger.error("mistral_db:login_error {}", exc)
-        raise
+        logger.error("mistral_db:login error {}", exc)
+        return False, f"Грешка при вход: {exc}"
 
 def detect_login_method(cur: Any | None = None) -> Dict[str, Any]:
     """Открива дали се ползва LOGIN процедура или USERS/LOGUSERS."""
