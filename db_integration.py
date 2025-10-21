@@ -16,15 +16,20 @@ from mistral_db import (  # type: ignore[attr-defined]
     _require_cursor,
     connect,
     create_open_delivery,
+    check_login_credentials,
     detect_catalog_schema,
     detect_login_method,
     find_material_candidates,
+    db_lookup_by_barcode as _raw_db_lookup_barcode,
+    db_lookup_by_material_code as _raw_db_lookup_code,
+    db_lookup_by_name as _raw_db_lookup_name,
     get_item_by_barcode,
     get_item_by_code,
     get_items_by_name,
     get_active_driver,
     get_connection_info,
     get_last_login_trace,
+    get_last_login_status,
     get_material_by_barcode,
     get_catalog_preview,
     get_catalog_counts,
@@ -1197,15 +1202,78 @@ def _ensure_connection(session: Any, profile_label: str, profile: Dict[str, Any]
     return conn, cur
 
 
+def db_check_login(session: Any, username: str, password: str) -> bool:
+    """Проверява входа чрез реалната база данни."""
+
+    username = (username or "").strip()
+    password = password or ""
+    profile_label, profile = _resolve_profile(session)
+    conn, cur = _ensure_connection(session, profile_label, profile)
+    logger.info(
+        "db_integration:login start profile=%s username=%s",
+        profile_label,
+        username or "<password-only>",
+    )
+    object_id = profile.get("object_id") or profile.get("OBJECTID")
+    table_no = profile.get("table_no") or profile.get("TABLENO") or profile.get("table")
+    try:
+        _require_cursor(conn, cur, profile_label)
+        valid = check_login_credentials(
+            username,
+            password,
+            object_id=object_id or 1,
+            table_no=table_no or 1,
+        )
+        if valid:
+            logger.info(
+                "db_integration:login success profile=%s username=%s mode=%s",
+                profile_label,
+                username or "<password-only>",
+                get_last_login_status().get("mode"),
+            )
+        else:
+            logger.info(
+                "db_integration:login rejected profile=%s username=%s",
+                profile_label,
+                username or "<password-only>",
+            )
+        return bool(valid)
+    except Exception as exc:
+        logger.error(
+            "db_integration:login error profile=%s username=%s → %s",
+            profile_label,
+            username or "<password-only>",
+            exc,
+        )
+        raise
+
+
+def db_lookup_by_barcode(code: str) -> Optional[Dict[str, Any]]:
+    """Връща материал по баркод от базата."""
+
+    result = _raw_db_lookup_barcode(code)
+    if result:
+        result["source"] = "db"
+    return result
+
+
+def db_lookup_by_code(code: str) -> Optional[Dict[str, Any]]:
+    result = _raw_db_lookup_code(code)
+    if result:
+        result["source"] = "db"
+    return result
+
+
+def db_lookup_by_name(name: str, limit: int = 10) -> List[Dict[str, Any]]:
+    results = _raw_db_lookup_name(name, limit)
+    for entry in results:
+        entry["source"] = "db"
+    return results
+
+
 def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
     username = (username or "").strip()
     password = password or ""
-    if not username:
-        message = "Моля, въведете потребителско име."
-        logger.warning("Отказан логин без потребителско име.")
-        trace = get_last_login_trace()
-        session.last_login_trace = trace
-        return {"error": message, "trace": trace}
     if password == "":
         message = "Моля, въведете парола."
         logger.warning("Отказан логин без парола.")
@@ -1221,43 +1289,36 @@ def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
         session.last_login_trace = trace
         return {"error": str(exc), "trace": trace}
 
-    pc_id = _resolve_pc_id(session)
     logger.info(
         "Опит за логин (профил: {}, потребител: {})",
         profile_label,
-        username,
+        username or "<само парола>",
     )
-    if pc_id:
-        logger.info("Login параметри към процедурата: потребител=%s | pc_id=%s", username, pc_id)
-    else:
-        logger.info("Login параметри към процедурата: потребител=%s | pc_id=<липсва>", username)
     try:
-        operator_id, operator_login = login_user(username, password, pc_id=pc_id)
-    except MistralDBError as exc:
-        message = str(exc)
-        logger.warning(
+        is_valid = db_check_login(session, username, password)
+    except Exception as exc:
+        logger.error(
             "Логинът беше неуспешен (профил: {}, потребител: {}): {}",
             profile_label,
-            username,
-            message,
+            username or "<само парола>",
+            exc,
         )
-        if "Няма активна връзка" in message:
-            try:
-                _ensure_connection(session, profile_label, profile)
-                operator_id, operator_login = login_user(username, password, pc_id=pc_id)
-            except MistralDBError as retry_exc:
-                logger.error(
-                    "Повторният опит за логин се провали (профил: {}): {}",
-                    profile_label,
-                    retry_exc,
-                )
-                trace = get_last_login_trace()
-                session.last_login_trace = trace
-                return {"error": str(retry_exc), "trace": trace}
-        else:
-            trace = get_last_login_trace()
-            session.last_login_trace = trace
-            return {"error": message, "trace": trace}
+        trace = get_last_login_trace()
+        session.last_login_trace = trace
+        return {"error": str(exc), "trace": trace}
+
+    if not is_valid:
+        status = get_last_login_status()
+        error_message = status.get("error") or "Невалиден потребител или парола."
+        logger.warning(
+            "Логинът беше отхвърлен (профил: {}, потребител: {}): {}",
+            profile_label,
+            username or "<само парола>",
+            error_message,
+        )
+        trace = get_last_login_trace()
+        session.last_login_trace = trace
+        return {"error": error_message, "trace": trace}
 
     session.profile_label = profile_label
     preview = get_catalog_preview()
@@ -1280,11 +1341,13 @@ def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
             catalog_totals.get("materials", 0),
             catalog_totals.get("barcodes", 0),
         )
+    operator_id = 1
+    operator_login = username or "1"
     logger.info(
-        "Успешен логин (профил: {}, потребител: {}, оператор ID: {})",
+        "Успешен логин (профил: {}, потребител: {}, механизъм: {})",
         profile_label,
         operator_login,
-        operator_id,
+        get_last_login_status().get("mode"),
     )
     trace = get_last_login_trace()
     session.last_login_trace = trace

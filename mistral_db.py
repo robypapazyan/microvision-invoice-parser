@@ -118,6 +118,8 @@ _last_login_trace: List[Dict[str, Any]] = []
 _CATALOG_PREVIEW_MATERIALS: List[Dict[str, str]] = []
 _CATALOG_PREVIEW_BARCODES: List[Dict[str, str]] = []
 _CATALOG_TABLES_READY: bool = False
+_LAST_LOGIN_MODE: str | None = None
+_LAST_LOGIN_ERROR: str | None = None
 
 
 def _configure_logging() -> None:
@@ -1481,6 +1483,91 @@ def find_material_candidates(
     return materials
 
 
+def db_lookup_by_barcode(barcode: str) -> Optional[Dict[str, Any]]:
+    """Търси артикул по баркод чрез директна заявка."""
+
+    value = (barcode or "").strip()
+    if not value:
+        return None
+
+    cur = _require_cursor()
+    cur.execute(
+        """
+        SELECT b.CODE,
+               COALESCE(b.STORAGEMATERIALCODE, b.MATERIALCODE) AS MATCODE,
+               m.MATERIAL
+        FROM BARCODE b
+        LEFT JOIN MATERIAL m
+          ON m.MATERIALCODE = COALESCE(b.STORAGEMATERIALCODE, b.MATERIALCODE)
+        WHERE TRIM(b.CODE) = TRIM(?)
+    """,
+        (value,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    code = _clean_str(row[1]) or _clean_str(row[0])
+    name = _clean_str(row[2])
+    return {
+        "barcode": value,
+        "code": code,
+        "name": name,
+    }
+
+
+def db_lookup_by_material_code(code: str) -> Optional[Dict[str, Any]]:
+    value = (code or "").strip()
+    if not value:
+        return None
+
+    cur = _require_cursor()
+    cur.execute(
+        """
+        SELECT m.MATERIALCODE, m.MATERIAL
+        FROM MATERIAL m
+        WHERE TRIM(m.MATERIALCODE) = TRIM(?)
+    """,
+        (value,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "code": _clean_str(row[0]),
+        "name": _clean_str(row[1]),
+    }
+
+
+def db_lookup_by_name(name: str, limit: int = 10) -> List[Dict[str, Any]]:
+    pattern = " ".join((name or "").split())
+    if not pattern:
+        return []
+
+    cur = _require_cursor()
+    try:
+        safe_limit = max(1, min(int(limit), 100))
+    except Exception:  # pragma: no cover - защитно
+        safe_limit = 10
+    like_pattern = f"%{pattern.upper()}%"
+    sql = (
+        f"SELECT FIRST {safe_limit} m.MATERIALCODE, m.MATERIAL "
+        "FROM MATERIAL m "
+        "WHERE UPPER(TRIM(m.MATERIAL)) LIKE ? "
+        "ORDER BY m.MATERIAL"
+    )
+    cur.execute(sql, (like_pattern,))
+    rows = cur.fetchall() or []
+    results: List[Dict[str, Any]] = []
+    for row in rows:
+        results.append(
+            {
+                "code": _clean_str(row[0]),
+                "name": _clean_str(row[1]),
+            }
+        )
+    return results
+
+
 def get_item_by_barcode(cur: Any, barcode: str) -> Optional[Dict[str, Any]]:
     """Търси артикул по баркод."""
 
@@ -1849,6 +1936,114 @@ def connect(profile: Dict[str, Any]) -> Tuple[Any, Any]:
     _log_info(f"Свързването е успешно ({connection_text}, профил={profile_label})")
     return conn, cur
 
+
+def _set_login_status(mode: str, error: str | None = None) -> None:
+    global _LAST_LOGIN_MODE, _LAST_LOGIN_ERROR
+    _LAST_LOGIN_MODE = mode
+    _LAST_LOGIN_ERROR = error
+
+
+def get_last_login_status() -> Dict[str, Any]:
+    """Връща обобщена информация за последния опит за вход."""
+
+    status: Dict[str, Any] = {
+        "mode": _LAST_LOGIN_MODE,
+    }
+    if _LAST_LOGIN_ERROR:
+        status["error"] = _LAST_LOGIN_ERROR
+    return status
+
+
+def _procedure_exists(cur: Any, name: str) -> bool:
+    cur = _require_cursor(cur=cur)
+    cur.execute(
+        """
+        SELECT 1
+        FROM rdb$procedures
+        WHERE UPPER(TRIM(rdb$procedure_name)) = UPPER(TRIM(?))
+    """,
+        (name,),
+    )
+    return cur.fetchone() is not None
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:  # pragma: no cover - защитно
+        return default
+
+
+def check_login_credentials(
+    username: str,
+    password: str,
+    *,
+    object_id: Any | None = None,
+    table_no: Any | None = None,
+) -> bool:
+    """Проверява входните данни чрез процедурата или USERS таблицата."""
+
+    cur = _require_cursor()
+    username = (username or "").strip()
+    password = password or ""
+    effective_object_id = _coerce_int(object_id, 1)
+    effective_table_no = _coerce_int(table_no, 1)
+
+    logger.info(
+        "mistral_db:login_attempt profile=%s username=%s",
+        _profile_label(),
+        username or "<password-only>",
+    )
+
+    try:
+        if username and _procedure_exists(cur, "CHECKUSERFORTABLENO"):
+            logger.debug("mistral_db:login using CHECKUSERFORTABLENO")
+            _set_login_status("procedure")
+            cur.execute(
+                "SELECT CHRESULT FROM CHECKUSERFORTABLENO(?, ?, ?)",
+                (effective_object_id, username, effective_table_no),
+            )
+            row = cur.fetchone()
+            result = (row[0] if row else None)
+            if result is None:
+                _set_login_status("procedure", "Процедурата не върна стойност.")
+                return False
+            ch_result = str(result).strip()
+            logger.debug("mistral_db:login procedure result=%s", ch_result)
+            success = ch_result == "1"
+            if not success:
+                _set_login_status("procedure", f"CHRESULT={ch_result or '0'}")
+            else:
+                _set_login_status("procedure")
+            return success
+
+        logger.debug("mistral_db:login using USERS fallback")
+        _set_login_status("fallback")
+        sql = [
+            "SELECT COUNT(*) FROM USERS WHERE 1=1",
+        ]
+        params: List[Any] = []
+        if username:
+            sql.append("AND UPPER(TRIM(NAME)) = UPPER(TRIM(?))")
+            params.append(username)
+        else:
+            sql.append("AND NAME IS NOT NULL")
+        sql.append("AND TRIM(PASS) = TRIM(?)")
+        params.append(password)
+        query = " ".join(sql)
+        cur.execute(query, tuple(params))
+        row = cur.fetchone()
+        matches = int(row[0]) if row and row[0] is not None else 0
+        logger.debug("mistral_db:login fallback matches=%s", matches)
+        if matches > 0:
+            _set_login_status("fallback")
+            return True
+        _set_login_status("fallback", "Невалидни потребител/парола")
+        return False
+    except Exception as exc:  # pragma: no cover - защитно
+        _set_login_status("failed", str(exc))
+        logger.error("mistral_db:login_error {}", exc)
+        raise
 
 def detect_login_method(cur: Any | None = None) -> Dict[str, Any]:
     """Открива дали се ползва LOGIN процедура или USERS/LOGUSERS."""
