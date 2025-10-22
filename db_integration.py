@@ -11,6 +11,8 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypedDict
 
+import catalog_store
+
 from mistral_db import (  # type: ignore[attr-defined]
     MistralDBError,
     _require_cursor,
@@ -51,6 +53,7 @@ _MAPPING_FILE = Path(__file__).with_name("mapping.json")
 _MATERIALS_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
 _MATERIALS_BY_BARCODE: Optional[Dict[str, Dict[str, Any]]] = None
 _MAPPING_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
+_PASSWORD_ONLY_CACHE: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None
 
 
 @dataclass
@@ -1086,7 +1089,7 @@ def _merge_profile_sets(
 
 
 def _load_profiles() -> Dict[str, Dict[str, Any]]:
-    global _PROFILE_CACHE
+    global _PROFILE_CACHE, _PASSWORD_ONLY_CACHE
     if _PROFILE_CACHE is not None:
         return _PROFILE_CACHE
 
@@ -1117,6 +1120,7 @@ def _load_profiles() -> Dict[str, Dict[str, Any]]:
             value["database"] = os.path.normpath(os.fspath(database_path))
 
     _PROFILE_CACHE = profiles
+    _PASSWORD_ONLY_CACHE = None
     return profiles
 
 
@@ -1148,6 +1152,76 @@ def _resolve_profile(session: Any) -> Tuple[str, Dict[str, Any]]:
     return str(profile_label), profile
 
 
+def _normalize_password_entry(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    username = str(entry.get("username") or entry.get("name") or "").strip()
+    raw_id = entry.get("id")
+    user_id: Optional[int]
+    if raw_id in (None, ""):
+        user_id = None
+    else:
+        try:
+            user_id = int(raw_id)
+        except (TypeError, ValueError):
+            user_id = None
+    if not username and user_id is None:
+        return None
+    payload = {"username": username or None, "id": user_id}
+    return payload
+
+
+def _load_password_only_map() -> Dict[str, Dict[str, Dict[str, Any]]]:
+    global _PASSWORD_ONLY_CACHE
+    if _PASSWORD_ONLY_CACHE is not None:
+        return _PASSWORD_ONLY_CACHE
+
+    profiles = _load_profiles()
+    mapping: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for profile_label, profile in profiles.items():
+        raw_mapping = profile.get("password_only")
+        if not isinstance(raw_mapping, dict):
+            continue
+        normalized: Dict[str, Dict[str, Any]] = {}
+        for raw_password, entry in raw_mapping.items():
+            if not isinstance(raw_password, str):
+                try:
+                    raw_password = str(raw_password)
+                except Exception:
+                    continue
+            if not raw_password:
+                continue
+            if not isinstance(entry, dict):
+                entry = {"username": entry}
+            normalized_entry = _normalize_password_entry(entry)
+            if not normalized_entry:
+                continue
+            normalized[raw_password] = normalized_entry
+        if normalized:
+            mapping[str(profile_label)] = normalized
+
+    _PASSWORD_ONLY_CACHE = mapping
+    return mapping
+
+
+def _resolve_password_only_user(
+    profile_label: str, password: str
+) -> Optional[Tuple[str, Optional[int]]]:
+    mapping = _load_password_only_map()
+    profile_map = mapping.get(str(profile_label))
+    if not profile_map:
+        return None
+    entry = profile_map.get(password)
+    if not entry:
+        return None
+    username = str(entry.get("username") or "").strip()
+    user_id = entry.get("id")
+    if user_id is not None:
+        try:
+            user_id = int(user_id)
+        except (TypeError, ValueError):
+            user_id = None
+    return username, user_id
+
+
 def initialize_session(session: Any, profile_key: str) -> Tuple[Any, Any]:
     profile = _load_profile(profile_key)
     logger.info("Инициализация на сесия за профил: {}", profile_key)
@@ -1172,9 +1246,39 @@ def initialize_session(session: Any, profile_key: str) -> Tuple[Any, Any]:
     return conn, cur
 
 
+def close_session_connection(session: Any) -> None:
+    conn = getattr(session, "conn", None)
+    cur = getattr(session, "cur", None)
+    for handle in (cur, conn):
+        if handle is None:
+            continue
+        try:
+            handle.close()  # type: ignore[attr-defined]
+        except Exception:
+            continue
+    session.conn = None
+    session.cur = None
+    try:
+        session.connection_info = {}
+    except Exception:
+        pass
+    catalog_store.clear()
+
+
 def _ensure_connection(session: Any, profile_label: str, profile: Dict[str, Any]) -> Tuple[Any, Any]:
     conn = getattr(session, "conn", None)
     cur = getattr(session, "cur", None)
+    active_label = getattr(session, "profile_label", None)
+    if active_label and active_label != profile_label:
+        logger.debug(
+            "Затваряне на връзката (профил сменен от %s към %s)",
+            active_label,
+            profile_label,
+        )
+        close_session_connection(session)
+        conn = None
+        cur = None
+
     if conn is not None and cur is not None:
         try:
             _require_cursor(conn, cur, profile_label)
@@ -1288,6 +1392,91 @@ def db_lookup_by_name(name: str, limit: int = 10) -> List[Dict[str, Any]]:
     return results
 
 
+def _load_catalog_for_profile(
+    session: Any, profile_label: str
+) -> Tuple[int, int]:
+    cur = getattr(session, "cur", None)
+    if cur is None:
+        return 0, 0
+
+    schema = detect_catalog_schema(cur)
+    materials_table = schema.get("materials_table") or "MATERIAL"
+    material_code_col = schema.get("code_id_col") or "MATERIALCODE"
+    material_name_col = schema.get("code_name_col") or "MATERIAL"
+    barcode_table_name = schema.get("barcode_table")
+    barcode_table = barcode_table_name or ""
+    barcode_code_col = schema.get("code_col") or "CODE"
+    barcode_fk_col = schema.get("fk_col") or "FK_STORAGEMATERIALCODE"
+
+    materials_query = (
+        f"SELECT {material_code_col}, {material_name_col} FROM {materials_table}"
+    )
+    barcode_query = None
+    if barcode_table_name:
+        barcode_query = (
+            f"SELECT {barcode_code_col}, {barcode_fk_col} FROM {barcode_table_name}"
+        )
+
+    materials: Dict[str, Dict[str, Any]] = {}
+    barcodes: Dict[str, str] = {}
+
+    try:
+        rows = fetch_all(materials_query, (), cur=cur) or []
+    except Exception as exc:
+        logger.warning(
+            "Неуспешно зареждане на MATERIAL (%s): %s",
+            materials_table,
+            exc,
+        )
+        rows = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or not row:
+            continue
+        code = str(row[0]).strip()
+        if not code:
+            continue
+        name = str(row[1] or "").strip()
+        materials[code] = {"code": code, "name": name}
+
+    if barcode_query:
+        try:
+            rows = fetch_all(barcode_query, (), cur=cur) or []
+        except Exception as exc:
+            logger.warning(
+                "Неуспешно зареждане на BARCODE (%s): %s",
+                barcode_table,
+                exc,
+            )
+            rows = []
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or not row:
+                continue
+            barcode_value = str(row[0]).strip()
+            if not barcode_value:
+                continue
+            material_code_value = str(row[1]).strip() if len(row) > 1 else ""
+            if not material_code_value:
+                continue
+            barcodes[barcode_value] = material_code_value
+
+    by_name = catalog_store.prepare_name_index(materials)
+    catalog_store.set_catalog(
+        profile_label,
+        {
+            "materials": materials,
+            "barcodes": barcodes,
+            "by_name": by_name,
+        },
+    )
+
+    session.catalog_data = {
+        "materials": materials,
+        "barcodes": barcodes,
+        "by_name": by_name,
+    }
+    return len(materials), len(barcodes)
+
+
 def _finalize_login_success(
     session: Any, profile_label: str, operator_id: int, operator_login: str
 ) -> Dict[str, Any]:
@@ -1316,11 +1505,15 @@ def _finalize_login_success(
 
     materials_total = _safe_total(totals.get("materials"))
     barcodes_total = _safe_total(totals.get("barcodes"))
-    logger.info(
-        "\U0001F4DA Реални каталожни данни: материали=%s | баркодове=%s",
-        materials_total,
-        barcodes_total,
-    )
+    loaded_materials, loaded_barcodes = _load_catalog_for_profile(session, profile_label)
+    if loaded_materials or loaded_barcodes:
+        logger.info(
+            "\U0001F4DA Реални каталожни данни: материали=%s | баркодове=%s",
+            loaded_materials,
+            loaded_barcodes,
+        )
+    else:
+        logger.warning("Каталогът не можа да бъде зареден след вход.")
 
     schema = {}
     if isinstance(session.profile_data, dict):
@@ -1359,86 +1552,40 @@ def _login_by_username_and_password(
     return operator_id, operator_login
 
 
-def _login_by_password_only(session: Any, profile_label: str, password: str) -> Tuple[int, str]:
-    encoded = encode_password(password)
-    cur = getattr(session, "cur", None)
-    rows = fetch_all(
-        "SELECT FIRST 2 ID, NAME FROM USERS WHERE TRIM(PASS) = ?",
-        (encoded,),
-        cur=cur,
-    )
-
-    candidates: List[Dict[str, Any]] = []
-    for row in rows:
-        if not isinstance(row, (list, tuple)) or not row:
-            continue
-        raw_id = row[0]
-        try:
-            user_id = int(raw_id)
-        except Exception:
-            continue
-        raw_name = row[1] if len(row) > 1 else ""
-        user_name = str(raw_name or "").strip() or str(user_id)
-        candidates.append({"id": user_id, "name": user_name})
-
-    if not candidates:
+def _login_by_password_only(
+    session: Any, profile_label: str, password: str
+) -> Tuple[str, Optional[int]]:
+    resolved = _resolve_password_only_user(profile_label, password)
+    if not resolved:
         logger.warning(
             "db_integration:login_by_password_only: no match (profile=%s)",
             profile_label,
         )
         raise MistralDBError("Невалидна парола.")
 
-    if len(candidates) == 1:
-        selected = candidates[0]
-    else:
-        logger.info(
-            "db_integration:login_by_password_only: multiple matches=%s (profile=%s)",
-            len(candidates),
+    username, user_id = resolved
+    if not username:
+        logger.warning(
+            "db_integration:login_by_password_only: missing username (profile=%s)",
             profile_label,
         )
-        selector = getattr(session, "select_user_callback", None)
-        selected_entry = None
-        if callable(selector):
-            try:
-                selected_entry = selector(candidates)
-            except Exception as exc:
-                logger.warning(
-                    "db_integration:login_by_password_only: selector error=%s (profile=%s)",
-                    exc,
-                    profile_label,
-                )
-                selected_entry = None
-        if not selected_entry:
-            logger.warning(
-                "db_integration:login_by_password_only: selection cancelled (profile=%s)",
-                profile_label,
-            )
-            raise MistralDBError("Входът е прекъснат.")
-        if isinstance(selected_entry, dict):
-            selected_id = int(selected_entry.get("id"))
-            selected_name = (
-                str(selected_entry.get("name") or "").strip() or str(selected_id)
-            )
-        elif isinstance(selected_entry, (list, tuple)):
-            selected_id = int(selected_entry[0])
-            raw_name = selected_entry[1] if len(selected_entry) > 1 else ""
-            selected_name = str(raw_name or "").strip() or str(selected_id)
-        else:
-            selected_id = int(selected_entry)
-            selected_name = str(selected_id)
-        selected = {"id": selected_id, "name": selected_name}
+        raise MistralDBError("Невалидна конфигурация за вход само с парола.")
 
     logger.info(
         "db_integration:login_by_password_only: success username=%s id=%s (password-only)",
-        selected["name"],
-        selected["id"],
+        username,
+        user_id,
     )
-    pc_id = _resolve_pc_id(session)
-    operator_id, operator_login = login_user(selected["name"], password, pc_id=pc_id)
-    return operator_id, operator_login
+    return username, user_id
 
 
-def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
+def perform_login(
+    session: Any,
+    username: str,
+    password: str,
+    *,
+    profile_key: Optional[str] = None,
+) -> Dict[str, Any]:
     username = (username or "").strip()
     password = password or ""
     if password == "":
@@ -1448,7 +1595,14 @@ def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
         session.last_login_trace = trace
         return {"error": message, "trace": trace}
     try:
-        profile_label, profile = _resolve_profile(session)
+        if profile_key:
+            profile = _load_profile(profile_key)
+            session.profile_name = profile_key
+            session.profile_label = profile_key
+            session.profile_data = profile
+            profile_label = profile_key
+        else:
+            profile_label, profile = _resolve_profile(session)
         _ensure_connection(session, profile_label, profile)
     except MistralDBError as exc:
         logger.error("Грешка при подготовка за логин: {}", exc)
@@ -1465,9 +1619,22 @@ def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
     login_mode_hint = "password-only" if not username else "username+password"
     try:
         if not username:
-            operator_id, operator_login = _login_by_password_only(
+            resolved_username, mapped_user_id = _login_by_password_only(
                 session, profile_label, password
             )
+            pc_id = _resolve_pc_id(session)
+            operator_id, operator_login = login_user(
+                resolved_username,
+                password,
+                pc_id=pc_id,
+            )
+            if mapped_user_id is not None and mapped_user_id != operator_id:
+                logger.debug(
+                    "ID от конфигурацията (%s) се различава от върнатия от Мистрал (%s)",
+                    mapped_user_id,
+                    operator_id,
+                )
+            username = resolved_username
         else:
             operator_id, operator_login = _login_by_username_and_password(
                 session, profile_label, username, password
@@ -1664,3 +1831,34 @@ def push_parsed_rows(session: Any, rows: List[Dict[str, Any]]) -> None:
         "manual": manual_choices,
         "unresolved": unresolved,
     }
+
+
+def export_txt(rows: List[Dict[str, Any]], file_path: str) -> None:
+    header = (
+        "Склад\tСклад\tНомер\tИме на материал\tК-во\tЕд. цена\tПродажна цена\tБаркод\n"
+    )
+    with open(file_path, "w", encoding="cp1251", errors="replace") as fh:
+        fh.write(header)
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            code = str(item.get("code") or "")
+            name = str(item.get("name") or "")
+            qty = item.get("qty")
+            price = item.get("price")
+            sale_price = item.get("sale_price")
+            barcode = str(item.get("barcode") or "")
+
+            def _fmt(value: Any) -> str:
+                if value is None:
+                    return ""
+                if isinstance(value, Decimal):
+                    return f"{value:.2f}"
+                return str(value)
+
+            line = (
+                f"1.00\tСклад\t{code}\t{name}\t{_fmt(qty)}\t"
+                f"{_fmt(price)}\t{_fmt(sale_price)}\t{barcode}\n"
+            )
+            fh.write(line)
+    logger.info("TXT експортът е записан (редове=%s, файл=%s)", len(rows), file_path)

@@ -17,6 +17,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
 import db_integration
+import catalog_store
 from mistral_db import logger
 
 try:  # legacy fallback
@@ -366,20 +367,31 @@ class ItemResolverDialog(tk.Toplevel):
             self.status_var.set("Няма резултати.")
 
     def _on_check_manual(self) -> None:
-        if self.resolver is None:
-            return
         code = self.manual_var.get().strip()
         if not code:
             self.status_var.set("Въведете код за проверка.")
             return
-        hit = self.resolver.ensure_item(code)
+        resolver = self.resolver
+        hit = None
+        if resolver is not None:
+            hit = resolver.ensure_item(code)
         if hit:
             self._manual_hit = hit
             self.status_var.set(f"Кодът е намерен: {hit['name']}")
             self.ok_btn.state(["!disabled"])
         else:
-            self._manual_hit = None
-            self.status_var.set("Кодът не е намерен.")
+            fallback = catalog_store.get_material(code) if catalog_store.has_data() else None
+            if fallback:
+                hit = db_integration.ItemHit(
+                    code=fallback.get("code", code),
+                    name=fallback.get("name", ""),
+                )
+                self._manual_hit = hit
+                self.status_var.set(f"Кодът е намерен в каталога: {hit['name']}")
+                self.ok_btn.state(["!disabled"])
+            else:
+                self._manual_hit = None
+                self.status_var.set("Кодът не е намерен.")
 
     def _on_confirm(self, _event: Any = None) -> None:
         chosen_hit: Optional[db_integration.ItemHit] = None
@@ -743,6 +755,14 @@ class MicroVisionApp:
                     charset_value = connection_info.get("charset")
                     if charset_value:
                         diag_lines.append(f"Charset: {charset_value}")
+                active_profile = self.active_profile_name or profile_name
+                if active_profile:
+                    diag_lines.append(f"Активен профил: {active_profile}")
+                if catalog_store.is_loaded_for(self.active_profile_name):
+                    materials_count, barcode_count = catalog_store.get_stats()
+                    diag_lines.append(
+                        f"Каталог: материали={materials_count} | баркодове={barcode_count}"
+                    )
 
                 schema_info = diag_info.get("schema") or {}
                 if isinstance(schema_info, dict) and schema_info.get("materials_table"):
@@ -845,6 +865,12 @@ class MicroVisionApp:
             self._log(f"Профил зареден: {profile_name}")
 
     def _reset_login_state(self) -> None:
+        close_fn = getattr(db_integration, "close_session_connection", None)
+        if callable(close_fn):
+            try:
+                close_fn(self.session)
+            except Exception as exc:
+                logger.debug("Неуспешно затваряне на връзката при смяна на профил: %s", exc)
         self.session.username = ""
         self.session.user_id = None
         self.session.raw_login_payload = None
@@ -911,7 +937,12 @@ class MicroVisionApp:
         try:
             login_fn = getattr(db_integration, "perform_login", None)
             if callable(login_fn):
-                result = login_fn(self.session, username, password)
+                result = login_fn(
+                    self.session,
+                    username,
+                    password,
+                    profile_key=self.active_profile_name,
+                )
             else:
                 if operator_login_session is None:
                     raise RuntimeError("perform_login не е налична и няма резервна функция.")
@@ -971,7 +1002,12 @@ class MicroVisionApp:
         self.password_var.set("")
         self._toggle_login_diag_button(True)
         self._refresh_license_text()
-        if self.session.catalog_loaded:
+        if catalog_store.is_loaded_for(self.active_profile_name):
+            materials_count, barcodes_count = catalog_store.get_stats()
+            self._log(
+                f"📚 Заредени каталожни данни: материали={materials_count} | баркодове={barcodes_count}"
+            )
+        elif self.session.catalog_loaded:
             materials_preview = getattr(self.session, "materials_preview", []) or []
             barcodes_preview = getattr(self.session, "barcodes_preview", []) or []
             self._log(
@@ -1173,6 +1209,16 @@ class MicroVisionApp:
             or row.get("Артикул")
             or ""
         )
+        if not catalog_store.has_data():
+            self._log("Каталог не е зареден, не мога да валидирам код.")
+            try:
+                messagebox.showwarning(
+                    "Ръчно въвеждане",
+                    "Каталогът не е зареден, не мога да валидирам код.",
+                )
+            except Exception:
+                pass
+            return None
         while True:
             try:
                 manual_code = simpledialog.askstring(
@@ -1203,7 +1249,11 @@ class MicroVisionApp:
                     hit = resolver.ensure_item(code)
                 except Exception as exc:
                     self._log(f"⚠️ Ред {index}: проверката на код {code} е неуспешна: {exc}")
-            if resolver is not None and not hit:
+            if hit is None and catalog_store.has_data():
+                material = catalog_store.get_material(code)
+                if material:
+                    hit = db_integration.ItemHit(code=material.get("code", code), name=material.get("name", ""))
+            if resolver is not None and not hit and not catalog_store.has_data():
                 retry = False
                 try:
                     retry = messagebox.askretrycancel(
