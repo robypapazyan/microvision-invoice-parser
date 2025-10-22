@@ -122,6 +122,33 @@ _LAST_LOGIN_MODE: str | None = None
 _LAST_LOGIN_ERROR: str | None = None
 
 
+def encode_password(raw_password: str) -> str:
+    """Encodes raw numeric/alpha password using the legacy RQPO mapping used in USERS.PASS.
+
+    Example: '4321' -> 'RQPO'. Keeps '0' as '0'. Uppercases input first.
+    """
+
+    if raw_password is None:
+        return ""
+    s = str(raw_password).strip().upper()
+    map_digits = {
+        "0": "0",
+        "1": "O",
+        "2": "P",
+        "3": "Q",
+        "4": "R",
+        "5": "S",
+        "6": "T",
+        "7": "U",
+        "8": "V",
+        "9": "W",
+    }
+    out = []
+    for ch in s:
+        out.append(map_digits.get(ch, ch))
+    return "".join(out)
+
+
 def _configure_logging() -> None:
     global _LOG_CONFIGURED, logger
     if _LOG_CONFIGURED:
@@ -603,6 +630,17 @@ def _require_cursor(
     if not active_conn or not active_cur:
         raise MistralDBError(f"Няма активна връзка – опитайте отново (профил: {label}).")
     return active_cur
+
+
+def fetch_all(sql: str, params: Sequence[Any] | None = None, *, cur: Any | None = None) -> List[Any]:
+    """Изпълнява SELECT и връща всички редове, като поддържа общата обработка на грешки."""
+
+    active_cur = _require_cursor(cur=cur)
+    try:
+        active_cur.execute(sql, tuple(params or ()))
+        return list(active_cur.fetchall())
+    except _FB_ERROR as exc:
+        raise MistralDBError(f"Грешка при изпълнение на заявка: {exc}") from exc
 
 
 def _mask_sensitive(value: Any) -> Any:
@@ -2027,6 +2065,7 @@ def check_login_credentials(
 
     username = (username or "").strip()
     password = password or ""
+    encoded_password = encode_password(password)
     if not username:
         _set_login_status("failed", "Липсва потребителско име.")
         return False, "Моля, въведете потребителско име."
@@ -2054,7 +2093,7 @@ def check_login_credentials(
             FROM USERS
             WHERE UPPER(NAME) = UPPER(?) AND TRIM(PASS) = TRIM(?)
             """,
-            (username, password),
+            (username, encoded_password),
         )
         row = active_cur.fetchone()
         matches = int(row[0]) if row and row[0] is not None else 0
@@ -2774,7 +2813,7 @@ def _login_via_users_table(
     hash_field = fields.get("password_hash")
 
     username_clean = username.strip()
-    password_value = password
+    password_value = encode_password(password)
     mode = "username" if username_clean else "password"
 
     if not pass_field and hash_field and not password_value:
@@ -2798,7 +2837,7 @@ def _login_via_users_table(
     effective_pass_field = pass_field or hash_field or "PASS"
 
     clauses = [f"TRIM({effective_pass_field}) = TRIM(?)"]
-    params: List[Any] = [password_value.strip() if isinstance(password_value, str) else password_value]
+    params: List[Any] = [password_value]
     if username_clean:
         clauses.insert(0, f"UPPER(TRIM({login_field})) = UPPER(TRIM(?))")
         params.insert(0, username_clean)
@@ -2849,7 +2888,7 @@ def _login_via_users_table(
 
     row = rows[0]
     stored_pass = "" if row[2] is None else str(row[2]).strip()
-    password_comp = password_value.strip() if isinstance(password_value, str) else password_value
+    password_comp = password_value
     if username_clean and stored_pass != (password_comp if password_comp is not None else ""):
         _trace(
             "table_no_match",

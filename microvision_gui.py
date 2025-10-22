@@ -97,6 +97,7 @@ class SessionState:
     password: str = ""
     ui_root: Any = None
     output_logger: Optional[Callable[[str], None]] = None
+    select_user_callback: Optional[Callable[[List[Dict[str, Any]]], Optional[Dict[str, Any]]]] = None
     unresolved_items: List[Dict[str, Any]] = field(default_factory=list)
     catalog_preview: Dict[str, Any] = field(default_factory=dict)
     catalog_loaded: bool = False
@@ -169,6 +170,73 @@ class CandidateDialog(tk.Toplevel):
         self.wait_window()
         return self.result
 
+
+class UserSelectionDialog(tk.Toplevel):
+    """Диалог за избор на потребител при вход само с парола."""
+
+    def __init__(self, parent: tk.Tk, users: List[Dict[str, Any]]) -> None:
+        super().__init__(parent)
+        self.result: Optional[Dict[str, Any]] = None
+        self._users = list(users)
+        self.title("Избор на потребител")
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="Намерени са няколко потребителя.").pack(anchor="w")
+        ttk.Label(frame, text="Моля, изберете един за вход:").pack(anchor="w", pady=(0, 6))
+
+        self.listbox = tk.Listbox(frame, height=min(8, len(self._users)) or 4, width=40, exportselection=False)
+        self.listbox.pack(fill="both", expand=True, pady=(0, 8))
+        for user in self._users:
+            display = f"{user.get('name', '')} (ID: {user.get('id', '')})"
+            self.listbox.insert(tk.END, display.strip())
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x")
+        self.ok_btn = ttk.Button(buttons, text="OK", command=self._on_confirm)
+        self.ok_btn.pack(side="left")
+        ttk.Button(buttons, text="Отказ", command=self._on_cancel).pack(side="right")
+
+        self.listbox.bind("<Double-Button-1>", lambda _e: self._on_confirm())
+        self.listbox.bind("<<ListboxSelect>>", self._on_select_change)
+        self.bind("<Return>", lambda _e: self._on_confirm())
+        self.bind("<Escape>", lambda _e: self._on_cancel())
+
+        if self._users:
+            self.listbox.selection_set(0)
+        self._update_button_state()
+        self.listbox.focus_set()
+
+    def _on_select_change(self, _event: tk.Event) -> None:
+        self._update_button_state()
+
+    def _update_button_state(self) -> None:
+        if self.listbox.curselection():
+            self.ok_btn.state(["!disabled"])
+        else:
+            self.ok_btn.state(["disabled"])
+
+    def _on_confirm(self) -> None:
+        selection = self.listbox.curselection()
+        if not selection:
+            return
+        idx = int(selection[0])
+        if 0 <= idx < len(self._users):
+            self.result = dict(self._users[idx])
+        self.destroy()
+
+    def _on_cancel(self) -> None:
+        self.result = None
+        self.destroy()
+
+    def show(self) -> Optional[Dict[str, Any]]:
+        self.wait_window()
+        return self.result
 
 
 class ItemResolverDialog(tk.Toplevel):
@@ -371,9 +439,12 @@ def load_profiles(path: str = CLIENTS_JSON) -> Dict[str, Dict[str, Any]]:
 
     profiles: Dict[str, Dict[str, Any]] = {}
     if isinstance(data, dict):
-        for key, value in data.items():
+        source = data.get("profiles") if isinstance(data.get("profiles"), dict) else data
+        if not isinstance(source, dict):
+            source = {}
+        for key, value in source.items():
             if isinstance(value, dict):
-                profiles[str(key)] = value
+                profiles[str(key)] = dict(value)
     elif isinstance(data, list):
         for idx, item in enumerate(data):
             if not isinstance(item, dict):
@@ -406,6 +477,7 @@ class MicroVisionApp:
         self.session = SessionState()
         self.session.ui_root = self.root
         self.session.output_logger = self._log
+        self.session.select_user_callback = self._choose_user_by_password
         _check_runtime_dependencies()
         self.profiles = load_profiles()
         self.profile_names: List[str] = list(self.profiles.keys())
@@ -784,6 +856,21 @@ class MicroVisionApp:
         self.password_var.set("")
         self.login_status_var.set("Вход: няма активна сесия.")
         self._toggle_login_diag_button(False)
+
+    def _choose_user_by_password(
+        self, candidates: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        if not candidates:
+            return None
+        dialog = UserSelectionDialog(self.root, candidates)
+        result = dialog.show()
+        if result is None:
+            try:
+                messagebox.showinfo("Вход", "Входът е прекъснат.")
+            except Exception:
+                pass
+            return None
+        return result
 
     def _on_get_machine_id(self) -> None:
         mid = machine_id()

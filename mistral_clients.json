@@ -1,74 +1,85 @@
-[
-  {
-    "name": "Local TEST",
-    "driver": "fdb",
-    "host": "localhost",
-    "port": 3050,
-    "database": "D:/base/TESTBARBERSHOP.FDB",
-    "user": "SYSDBA",
-    "password": "masterkey",
-    "charset": "WIN1251",
-    "default_supplier_id": null,
-    "comment": "Imported by MicroVision",
-    "location_id": 1,
-    "storage_id": 1,
-    "operation_doc_type": 2,
-    "auth": {
-      "use_procedures": false,
-      "table_candidates": [
-        "USERS",
-        "OPERATORS",
-        "POTREBITELI",
-        "OPERATORI",
-        "USERI",
-        "PERSONS"
-      ],
-      "login_cols": [
-        "CODE",
-        "KOD",
-        "LOGIN",
-        "USERNAME",
-        "USER_NAME",
-        "NAME",
-        "OPERATOR"
-      ],
-      "password_cols": [
-        "PASS",
-        "PASSWORD",
-        "PAROLA",
-        "PASS_HASH",
-        "PAROLA_HASH",
-        "PWD"
-      ],
-      "salt_cols": [
-        "SALT"
-      ],
-      "hash_order": [
-        "MD5",
-        "SHA1",
-        "SHA256",
-        "PLAIN"
-      ]
+{
+  "profiles": {
+    "Local TEST": {
+      "driver": "fdb",
+      "host": "localhost",
+      "port": 3050,
+      "database": "D:/base/TESTBARBERSHOP.FDB",
+      "user": "SYSDBA",
+      "password": "masterkey",
+      "charset": "WIN1251",
+      "default_supplier_id": null,
+      "comment": "Imported by MicroVision",
+      "location_id": 1,
+      "storage_id": 1,
+      "operation_doc_type": 2,
+      "schema": {
+        "materials": {
+          "table": "MATERIAL",
+          "code_col": "MATERIAL_ID",
+          "name_col": "MATERIAL"
+        },
+        "barcodes": {
+          "table": "BARCODE",
+          "code_col": "CODE",
+          "mat_code_fk": "STORAGEMATERIALCODE"
+        }
+      },
+      "auth": {
+        "use_procedures": false,
+        "table_candidates": [
+          "USERS",
+          "OPERATORS",
+          "POTREBITELI",
+          "OPERATORI",
+          "USERI",
+          "PERSONS"
+        ],
+        "login_cols": [
+          "CODE",
+          "KOD",
+          "LOGIN",
+          "USERNAME",
+          "USER_NAME",
+          "NAME",
+          "OPERATOR"
+        ],
+        "password_cols": [
+          "PASS",
+          "PASSWORD",
+          "PAROLA",
+          "PASS_HASH",
+          "PAROLA_HASH",
+          "PWD"
+        ],
+        "salt_cols": [
+          "SALT"
+        ],
+        "hash_order": [
+          "MD5",
+          "SHA1",
+          "SHA256",
+          "PLAIN"
+        ]
+      }
+    },
+    "Книжарница": {
+      "host": "localhost",
+      "port": 3050,
+      "database": "D:\\мистрал книжарница\\PAPEX-Papex-2 (1).FDB",
+      "user": "SYSDBA",
+      "password": "masterkey",
+      "charset": "WIN1251",
+      "comment": "Примерен профил с кирилица в пътя"
+    },
+    "Micro Vision (реална)": {
+      "host": "localhost",
+      "port": 3050,
+      "database": "D:/Микро Вижън/Prod/MICROVISION.FDB",
+      "user": "SYSDBA",
+      "password": "masterkey",
+      "charset": "WIN1251",
+      "comment": "Реална база – попълнете коректни креденшъли"
     }
-  },
-  {
-    "name": "Книжарница",
-    "host": "localhost",
-    "port": 3050,
-    "database": "D:\\мистрал книжарница\\PAPEX-Papex-2 (1).FDB",
-    "user": "SYSDBA",
-    "password": "masterkey",
-    "charset": "WIN1251",
-    "comment": "Примерен профил с кирилица в пътя"
-  },
-  {
-    "name": "Micro Vision (реална)",
-    "host": "localhost",
-    "port": 3050,
-    "database": "D:/Микро Вижън/Prod/MICROVISION.FDB",
-    "user": "SYSDBA",
-    "password": "masterkey",
-    "charset": "WIN1251",
-    "comment": "Реална база – попълнете коректни креденшъли"
   }
-]
+}
