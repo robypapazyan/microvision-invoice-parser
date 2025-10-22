@@ -17,6 +17,7 @@ from mistral_db import (  # type: ignore[attr-defined]
     connect,
     create_open_delivery,
     check_login_credentials,
+    encode_password,
     detect_catalog_schema,
     detect_login_method,
     find_material_candidates,
@@ -33,6 +34,7 @@ from mistral_db import (  # type: ignore[attr-defined]
     get_material_by_barcode,
     get_catalog_preview,
     get_catalog_counts,
+    fetch_all,
     catalog_tables_loaded,
     logger,
     login_user,
@@ -1286,6 +1288,156 @@ def db_lookup_by_name(name: str, limit: int = 10) -> List[Dict[str, Any]]:
     return results
 
 
+def _finalize_login_success(
+    session: Any, profile_label: str, operator_id: int, operator_login: str
+) -> Dict[str, Any]:
+    session.profile_label = profile_label
+    preview = get_catalog_preview()
+    session.catalog_preview = preview
+    session.catalog_loaded = bool(preview.get("loaded")) or catalog_tables_loaded()
+    session.materials_preview = list(preview.get("materials", []))
+    session.barcodes_preview = list(preview.get("barcodes", []))
+    if session.catalog_loaded:
+        logger.info(
+            "Каталожните таблици са заредени: материали={}, баркодове={}",
+            len(session.materials_preview),
+            len(session.barcodes_preview),
+        )
+    else:
+        logger.warning("Каталожните таблици не върнаха данни след вход.")
+
+    totals = get_catalog_counts() or {}
+
+    def _safe_total(value: Any) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return 0
+
+    materials_total = _safe_total(totals.get("materials"))
+    barcodes_total = _safe_total(totals.get("barcodes"))
+    logger.info(
+        "\U0001F4DA Реални каталожни данни: материали=%s | баркодове=%s",
+        materials_total,
+        barcodes_total,
+    )
+
+    schema = {}
+    if isinstance(session.profile_data, dict):
+        schema = session.profile_data.get("schema") or {}
+    materials_table = "материали"
+    barcodes_table = "баркодове"
+    if isinstance(schema, dict):
+        materials_meta = schema.get("materials") or {}
+        barcodes_meta = schema.get("barcodes") or {}
+        if isinstance(materials_meta, dict):
+            materials_table = str(materials_meta.get("table") or materials_table)
+        if isinstance(barcodes_meta, dict):
+            barcodes_table = str(barcodes_meta.get("table") or barcodes_table)
+
+    if materials_total <= 0:
+        logger.warning(
+            "\u26a0\ufe0f Каталожната таблица %s е празна (schema mismatch?)",
+            materials_table,
+        )
+    if barcodes_total <= 0:
+        logger.warning(
+            "\u26a0\ufe0f Каталожната таблица %s е празна (schema mismatch?)",
+            barcodes_table,
+        )
+
+    trace = get_last_login_trace()
+    session.last_login_trace = trace
+    return {"user_id": operator_id, "login": operator_login}
+
+
+def _login_by_username_and_password(
+    session: Any, profile_label: str, username: str, password: str
+) -> Tuple[int, str]:
+    pc_id = _resolve_pc_id(session)
+    operator_id, operator_login = login_user(username, password, pc_id=pc_id)
+    return operator_id, operator_login
+
+
+def _login_by_password_only(session: Any, profile_label: str, password: str) -> Tuple[int, str]:
+    encoded = encode_password(password)
+    cur = getattr(session, "cur", None)
+    rows = fetch_all(
+        "SELECT FIRST 2 ID, NAME FROM USERS WHERE TRIM(PASS) = ?",
+        (encoded,),
+        cur=cur,
+    )
+
+    candidates: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or not row:
+            continue
+        raw_id = row[0]
+        try:
+            user_id = int(raw_id)
+        except Exception:
+            continue
+        raw_name = row[1] if len(row) > 1 else ""
+        user_name = str(raw_name or "").strip() or str(user_id)
+        candidates.append({"id": user_id, "name": user_name})
+
+    if not candidates:
+        logger.warning(
+            "db_integration:login_by_password_only: no match (profile=%s)",
+            profile_label,
+        )
+        raise MistralDBError("Невалидна парола.")
+
+    if len(candidates) == 1:
+        selected = candidates[0]
+    else:
+        logger.info(
+            "db_integration:login_by_password_only: multiple matches=%s (profile=%s)",
+            len(candidates),
+            profile_label,
+        )
+        selector = getattr(session, "select_user_callback", None)
+        selected_entry = None
+        if callable(selector):
+            try:
+                selected_entry = selector(candidates)
+            except Exception as exc:
+                logger.warning(
+                    "db_integration:login_by_password_only: selector error=%s (profile=%s)",
+                    exc,
+                    profile_label,
+                )
+                selected_entry = None
+        if not selected_entry:
+            logger.warning(
+                "db_integration:login_by_password_only: selection cancelled (profile=%s)",
+                profile_label,
+            )
+            raise MistralDBError("Входът е прекъснат.")
+        if isinstance(selected_entry, dict):
+            selected_id = int(selected_entry.get("id"))
+            selected_name = (
+                str(selected_entry.get("name") or "").strip() or str(selected_id)
+            )
+        elif isinstance(selected_entry, (list, tuple)):
+            selected_id = int(selected_entry[0])
+            raw_name = selected_entry[1] if len(selected_entry) > 1 else ""
+            selected_name = str(raw_name or "").strip() or str(selected_id)
+        else:
+            selected_id = int(selected_entry)
+            selected_name = str(selected_id)
+        selected = {"id": selected_id, "name": selected_name}
+
+    logger.info(
+        "db_integration:login_by_password_only: success username=%s id=%s (password-only)",
+        selected["name"],
+        selected["id"],
+    )
+    pc_id = _resolve_pc_id(session)
+    operator_id, operator_login = login_user(selected["name"], password, pc_id=pc_id)
+    return operator_id, operator_login
+
+
 def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
     username = (username or "").strip()
     password = password or ""
@@ -1309,9 +1461,18 @@ def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
         profile_label,
         username or "<само парола>",
     )
+
+    login_mode_hint = "password-only" if not username else "username+password"
     try:
-        db_check_login(session, username, password)
-    except RuntimeError as exc:
+        if not username:
+            operator_id, operator_login = _login_by_password_only(
+                session, profile_label, password
+            )
+        else:
+            operator_id, operator_login = _login_by_username_and_password(
+                session, profile_label, username, password
+            )
+    except MistralDBError as exc:
         error_message = str(exc)
         logger.warning(
             "Логинът беше отхвърлен (профил: {}, потребител: {}): {}",
@@ -1333,38 +1494,18 @@ def perform_login(session: Any, username: str, password: str) -> Dict[str, Any]:
         session.last_login_trace = trace
         return {"error": str(exc), "trace": trace}
 
-    session.profile_label = profile_label
-    preview = get_catalog_preview()
-    session.catalog_preview = preview
-    session.catalog_loaded = bool(preview.get("loaded")) or catalog_tables_loaded()
-    session.materials_preview = list(preview.get("materials", []))
-    session.barcodes_preview = list(preview.get("barcodes", []))
-    if session.catalog_loaded:
-        logger.info(
-            "Каталожните таблици са заредени: материали={}, баркодове={}",
-            len(session.materials_preview),
-            len(session.barcodes_preview),
-        )
-    else:
-        logger.warning("Каталожните таблици не върнаха данни след вход.")
-    catalog_totals = get_catalog_counts()
-    if catalog_totals:
-        logger.info(
-            "\U0001F4DA Реални каталожни данни: материали=%s | баркодове=%s",
-            catalog_totals.get("materials", 0),
-            catalog_totals.get("barcodes", 0),
-        )
-    operator_id = 1
-    operator_login = username or "1"
+    result = _finalize_login_success(session, profile_label, operator_id, operator_login)
+    trace = get_last_login_trace()
+    session.last_login_trace = trace
+    status = get_last_login_status()
+    effective_mode = status.get("mode") if isinstance(status, dict) else None
     logger.info(
         "Успешен логин (профил: {}, потребител: {}, механизъм: {})",
         profile_label,
         operator_login,
-        get_last_login_status().get("mode"),
+        effective_mode or login_mode_hint,
     )
-    trace = get_last_login_trace()
-    session.last_login_trace = trace
-    return {"user_id": operator_id, "login": operator_login}
+    return result
 
 
 def start_open_delivery(session: Any) -> int:
