@@ -5,6 +5,8 @@ import json
 import re
 import difflib
 
+import catalog_store
+
 try:
     import pandas as pd
 
@@ -564,6 +566,7 @@ def main(input_path=None, gui_mode=False):
     processed_lines_count = 0
     skipped_lines_count = 0
     matched_via_mapping = 0
+    matched_via_catalog = 0
     matched_via_fuzzy = 0
     matched_via_manual = 0
     failed_match_count = 0
@@ -613,6 +616,26 @@ def main(input_path=None, gui_mode=False):
         processed_lines_count += 1
         found = False
         item_data = None
+
+        if catalog_store.has_data():
+            catalog_match = catalog_store.lookup_token(line)
+            if catalog_match:
+                print(
+                    f"  ✅ Каталог: намерен материал {catalog_match.get('code')} – {catalog_match.get('name')}"
+                )
+                item_data = {
+                    'code': catalog_match.get('code'),
+                    'name': catalog_match.get('name'),
+                    'qty': extract_quantity(line),
+                    'purchase_price': catalog_match.get('purchase_price', '0.00'),
+                    'selling_price': catalog_match.get('sale_price', '0.00'),
+                    'barcode': catalog_match.get('barcode') or '',
+                    'token': line,
+                }
+                export_items.append(item_data)
+                matched_via_catalog += 1
+                found = True
+                continue
 
         only_name = normalize_line(line)
         # --- НАЧАЛО НА КОРЕКЦИЯТА ---
@@ -843,6 +866,7 @@ def main(input_path=None, gui_mode=False):
     print(f"Обработени продуктови редове: {processed_lines_count}")
     print("-" * 20)
     print(f"Намерени чрез mapping.json: {matched_via_mapping}")
+    print(f"Намерени чрез каталог: {matched_via_catalog}")
     print(f"Намерени чрез близко съвпадение (потвърдени): {matched_via_fuzzy}")
     print(f"Намерени чрез ръчно въведен код: {matched_via_manual}")
     print(f"Неуспешни/пропуснати продуктови редове: {failed_match_count}")

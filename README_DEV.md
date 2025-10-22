@@ -33,7 +33,7 @@ mistral_clients.json:
 json
 Copy code
 {
-  "office": {
+ "office": {
     "host": "127.0.0.1",
     "port": 3050,
     "database": "C:/MISTRAL/DATA/OFFICE.FDB",
@@ -42,6 +42,30 @@ Copy code
     "charset": "WIN1251"
   }
 }
+
+### 3а) Конфигурация на вход само с парола
+В `mistral_clients.json` (или локалния override `mistral_clients.local.json`) може да зададете секция `password_only` за всеки профил. Паролите **не се кодират** – стойността е raw текстът, който операторът въвежда. Пример:
+
+```json
+{
+  "profiles": {
+    "Local TEST": {
+      "database": "D:/base/TESTBARBERSHOP.FDB",
+      "password_only": {
+        "4321": {"username": "test", "id": 1}
+      }
+    },
+    "Книжарница": {
+      "database": "D:/mistral/SHOP.FDB",
+      "password_only": {
+        "0000": {"username": "shop", "id": 12}
+      }
+    }
+  }
+}
+```
+
+Същата парола може да е валидна само за профила, в който е описана. Ако няма съвпадение → „Невалидна парола.“. Полето `id` е опционално и се използва само за диагностика.
 4) Диагностика на логин (важно)
 
 ```
